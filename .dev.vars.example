@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local development. Never commit real values.
+ADMIN_EMAILS=your-admin@example.com
+AGENT_EMAILS=your-agent@example.com
+FROM_EMAIL=CX Pulse <verified-sender@your-domain.example>
+RESEND_API_KEY=re_replace_with_resend_key
+OTP_PEPPER=replace_with_a_long_random_secret
