@@ -64,8 +64,8 @@ function randomToken(bytes = 32) {
   const data = crypto.getRandomValues(new Uint8Array(bytes));
   return btoa(String.fromCharCode(...data))
     .replace(/=/g, "")
-    .replace(/\\+/g, "-")
-    .replace(/\\//g, "_");
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 }
 
 function randomOtp() {
@@ -167,7 +167,7 @@ async function requestOtp(request, env) {
   const parsed = await readJson(request, 2_000);
   if (!parsed.ok) return parsed.response;
   const email = normalizeEmail(parsed.body.email);
-  if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) || email.length > 254) {
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     return json({ error: "Enter a valid email address." }, 400);
   }
 
@@ -210,7 +210,7 @@ async function verifyOtp(request, env) {
   if (!parsed.ok) return parsed.response;
   const email = normalizeEmail(parsed.body.email);
   const code = String(parsed.body.code || "").trim();
-  if (!isAllowedEmail(email, env) || !/^\\d{6}$/.test(code)) {
+  if (!isAllowedEmail(email, env) || !/^\d{6}$/.test(code)) {
     return json({ error: "The code is invalid or has expired." }, 400);
   }
 
@@ -411,7 +411,7 @@ async function api(request, env) {
     if (path === "/api/cases" && method === "POST") return await createCase(request, user, env);
     if (path === "/api/reports/summary" && method === "GET") return await reportSummary(user, env);
 
-    const match = path.match(/^\\/api\\/cases\\/([A-Za-z0-9-]+)$/);
+    const match = path.match(/^\/api\/cases\/([A-Za-z0-9-]+)$/);
     if (match && method === "PATCH") return await updateCase(request, user, env, match[1]);
 
     return json({ error: "Endpoint not found." }, 404);
