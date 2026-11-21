@@ -53,7 +53,7 @@ test("rejects invalid category, priority, team and oversized fields", () => {
     summary: "This is a valid length summary.",
   };
   assert.equal(validateCasePayload(base).ok, false);
-  assert.equal(validateCasePayload({ ...base, category: "General enquiry", priority: "Normal", team: "Administration", summary: "short" }).ok, false);
+  assert.equal(validateCasePayload({ ...base, category: "General enquiry", priority: "Normal", team: "Administration", summary: "tiny" }).ok, false);
   assert.equal(validateCasePayload({ ...base, customerName: "A", category: "General enquiry", priority: "Normal", team: "Administration" }).ok, false);
 });
 
