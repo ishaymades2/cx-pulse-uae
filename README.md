@@ -10,7 +10,7 @@ A portfolio-grade operations application demonstrating customer case management,
 - **Database:** Cloudflare D1 schema and migration included.
 - **Security:** Email allowlist, one-time codes, hashed OTPs and session tokens, HTTP-only secure cookies, same-origin mutation checks, request validation, rate limiting and audit events.
 - **Tests:** Validation and allowlist unit tests.
-- **Not yet production-ready until:** D1 is created and bound, migration is applied, sender domain is verified with Resend, required Worker secrets/variables are set, and the live API is smoke-tested.
+- **Current deployment checkpoint (21 Nov 2026):** Cloudflare Worker is live; D1 binding is configured; the initial SQL migration has been applied; `/api/health` has returned `ok: true` and `databaseReachable: true`. Authentication is not yet enabled until the admin allowlist, OTP pepper, and Resend email settings are configured and tested.
 
 ## Demo and production behavior
 
@@ -36,44 +36,32 @@ npm install
 npm test
 ```
 
-### 2. Create the D1 database
+### 2. D1 database (already provisioned for the current deployment)
 
-```bash
-npx wrangler d1 create cx-pulse-uae-db
-```
+The production database `cx-pulse-uae-db` is already created, bound as `DB`, and the `migrations/0001_initial.sql` schema has been applied. The live health endpoint has confirmed database connectivity. Do not recreate the database or rerun the initial SQL migration on this deployment.
 
-Copy the returned database ID into `wrangler.toml`, replacing `REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID`.
+### 3. Configure email delivery and access
 
-### 3. Apply the database migration
-
-```bash
-npm run db:migrate:remote
-```
-
-### 4. Configure email delivery and access
-
-Verify a sending domain in Resend. Use a sender address on that verified domain. Configure the following in Cloudflare Worker settings; do not commit them to GitHub:
+For a first-person sign-in test, create the Resend account using the same address as the only administrator. Resend's shared testing sender `onboarding@resend.dev` can be used only for sending to the Resend account's own email address. For any additional staff recipients or production use, verify a domain you own and use a sender on that verified domain. Configure the following in Cloudflare Worker settings; do not commit secrets to GitHub:
 
 **Worker secrets**
 - `RESEND_API_KEY`: Resend API key.
 - `OTP_PEPPER`: long, random secret used to hash one-time codes.
 
 **Worker variables**
-- `FROM_EMAIL`: verified sender, for example `CX Pulse <no-reply@your-verified-domain.com>`.
-- `ADMIN_EMAILS`: comma-separated exact administrator email addresses.
-- `AGENT_EMAILS`: comma-separated exact staff email addresses.
+- `FROM_EMAIL`: for the initial single-admin test, `CX Pulse <onboarding@resend.dev>`; for production, a sender on your verified domain.
+- `ADMIN_EMAILS`: comma-separated exact administrator email addresses (currently set this to the administrator's exact login email).
+- `AGENT_EMAILS`: comma-separated exact staff email addresses (leave unset until staff are approved).
 
 Only allowlisted addresses can sign in. Admins can view all cases; agents can view cases they created or are assigned to. Keep the allowlists short and reviewed.
 
-### 5. Deploy
+### 4. Deploy
 
-```bash
-npm run deploy
-```
+After adding or changing variables/secrets in Cloudflare Dashboard, select Deploy so the new Worker version receives them. Code deployments from the connected GitHub repository continue through the configured deployment integration.
 
 The deployment uses the static assets in `public/` and routes `/api/*` through the Worker.
 
-### 6. Verify
+### 5. Verify
 
 - `GET /api/health` should return `ok: true` and `databaseConfigured: true`.
 - Request an OTP with an allowlisted address.
