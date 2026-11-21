@@ -393,7 +393,26 @@ async function api(request, env) {
   if (method !== "GET" && !isSameOrigin(request)) return json({ error: "Cross-origin request blocked." }, 403);
 
   if (path === "/api/health" && method === "GET") {
-    return json({ ok: true, service: "cx-pulse-uae", version: "1.0.0", databaseConfigured: Boolean(env.DB) });
+    try {
+      const db = requireDatabase(env);
+      const probe = await db.prepare("SELECT 1 AS ok").first();
+      return json({
+        ok: probe?.ok === 1,
+        service: "cx-pulse-uae",
+        version: "1.0.0",
+        databaseConfigured: true,
+        databaseReachable: probe?.ok === 1,
+      }, probe?.ok === 1 ? 200 : 503);
+    } catch (error) {
+      console.error("CX Pulse health check failed:", error?.message || error);
+      return json({
+        ok: false,
+        service: "cx-pulse-uae",
+        version: "1.0.0",
+        databaseConfigured: Boolean(env.DB),
+        databaseReachable: false,
+      }, 503);
+    }
   }
 
   try {
