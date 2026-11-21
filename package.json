@@ -7,9 +7,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test",
+    "test": "npm run check && node --test",
     "db:migrate:local": "wrangler d1 migrations apply cx-pulse-uae-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply cx-pulse-uae-db --remote"
+    "db:migrate:remote": "wrangler d1 migrations apply cx-pulse-uae-db --remote",
+    "check": "node --check src/index.js && node --check src/validation.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
