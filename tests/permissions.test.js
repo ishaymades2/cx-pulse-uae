@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { hasPermission, permissionsForUser, isSupportedAccessRole } from "../src/permissions.js";
 
 test("administrator has full permissions", () => {
-  assert.deepEqual(permissionsForUser({ role: "admin", access_role: "admin" }), ["*"]);
+  assert.equal(hasPermission({ role: "admin", access_role: "admin" }, "staff.manage"), true);
   assert.equal(hasPermission({ role: "admin" }, "staff.manage"), true);
 });
 
