@@ -460,7 +460,7 @@ async function createStaff(request,user,env) {
   if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
   const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
   const email=normalizeEmail(parsed.body.email),name=String(parsed.body.displayName||"").trim(),role=String(parsed.body.accessRole||"agent");
-  if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
   await db.prepare("INSERT INTO users (id,email,role,display_name,job_title,department,access_role,permissions_json,is_active,created_at,updated_at) VALUES (?,?,'agent',?,'','',?,'{}',1,?,?) ON CONFLICT(email) DO NOTHING").bind(id,email,name,role,now,now).run();
   const row=await db.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
