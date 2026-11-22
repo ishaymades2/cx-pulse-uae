@@ -6,6 +6,7 @@ import {
   STATUSES,
   validateCasePayload,
 } from "./validation.js";
+import { hasPermission, permissionsForUser, isSupportedAccessRole, VALID_PERMISSIONS } from "./permissions.js";
 
 const SESSION_SECONDS = 60 * 60 * 24 * 7;
 const OTP_SECONDS = 10 * 60;
@@ -178,7 +179,9 @@ async function requestOtp(request, env) {
     return json({ error: "Enter a valid email address." }, 400);
   }
 
-  const allowed = isAllowedEmail(email, env);
+  const existingUser = await db.prepare("SELECT id, is_active FROM users WHERE email = ?").bind(email).first();
+  const allowed = isAllowedEmail(email, env) || Boolean(existingUser?.is_active);
+  if (existingUser && !existingUser.is_active) return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
   if (!allowed) {
     // Do not disclose whether an email address is on the access list.
     return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
@@ -241,12 +244,12 @@ async function verifyOtp(request, env) {
   const role = roleForEmail(email, env);
   const userId = crypto.randomUUID();
   await db.prepare(
-    `INSERT INTO users (id, email, role, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(email) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
-  ).bind(userId, email, role, now, now).run();
+    `INSERT INTO users (id, email, role, display_name, access_role, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at`,
+  ).bind(userId, email, role, email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
 
-  const user = await db.prepare("SELECT id, email, role FROM users WHERE email = ?").bind(email).first();
+  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active FROM users WHERE email = ?").bind(email).first();
   const token = randomToken();
   const tokenHash = await sha256(token);
   await db.prepare(
@@ -275,7 +278,8 @@ async function getSessionUser(request, env) {
     return null;
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
-  return { id: row.id, email: row.email, role: row.role };
+  if (row.is_active === 0) return null;
+  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -391,6 +395,103 @@ async function reportSummary(user, env) {
   });
 }
 
+
+function audit(db, actorId, action, details = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  return db.prepare("INSERT INTO audit_log (id, actor_id, action, case_id, details_json, created_at) VALUES (?, ?, ?, NULL, ?, ?)")
+    .bind(crypto.randomUUID(), actorId, action, JSON.stringify(details), now).run();
+}
+function profileDto(row) {
+  return { id: row.id, email: row.email, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, permissions: permissionsForUser(row), isActive: Boolean(row.is_active), createdAt: row.created_at };
+}
+async function profileMe(user, env) {
+  const row = await requireDatabase(env).prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first();
+  return json({ profile: profileDto(row) });
+}
+async function createApproval(request, user, env) {
+  const parsed = await readJson(request, 3000); if (!parsed.ok) return parsed.response;
+  const type = String(parsed.body.type || "");
+  const reason = String(parsed.body.reason || "").trim();
+  if (!["name_change"].includes(type) || reason.length < 5 || reason.length > 500) return json({ error: "Provide a valid request and reason." }, 400);
+  const name = String(parsed.body.displayName || "").trim();
+  if (name.length < 2 || name.length > 80) return json({ error: "Name must be between 2 and 80 characters." }, 400);
+  const db = requireDatabase(env), now = Math.floor(Date.now()/1000), id = crypto.randomUUID();
+  await db.prepare("INSERT INTO approval_requests (id, requester_id, target_user_id, request_type, payload_json, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(id,user.id,user.id,type,JSON.stringify({displayName:name}),reason,now).run();
+  await audit(db,user.id,"approval.requested",{approvalId:id,type});
+  return json({ ok:true, requestId:id },201);
+}
+async function listApprovals(user, env) {
+  if (!hasPermission(user,"staff.view")) return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare(`SELECT a.*, u.email AS requester_email, u.display_name AS requester_name FROM approval_requests a JOIN users u ON u.id=a.requester_id ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 200`).all();
+  return json({requests:q.results||[]});
+}
+async function reviewApproval(request,user,env,id) {
+  if (user.role!=="admin") return json({error:"Only the administrator can approve requests."},403);
+  const parsed=await readJson(request,3000); if(!parsed.ok)return parsed.response;
+  const db=requireDatabase(env), row=await db.prepare("SELECT * FROM approval_requests WHERE id=?").bind(id).first();
+  if(!row)return json({error:"Request not found."},404);
+  if(row.status!=="pending")return json({error:"This request has already been reviewed."},409);
+  const decision=String(parsed.body.decision||""), note=String(parsed.body.note||"").trim();
+  if(!["approved","rejected"].includes(decision))return json({error:"Choose approve or reject."},400);
+  const now=Math.floor(Date.now()/1000);
+  if(decision==="approved" && row.request_type==="name_change"){
+    const payload=JSON.parse(row.payload_json||"{}");
+    await db.prepare("UPDATE users SET display_name=?, updated_at=? WHERE id=?").bind(payload.displayName,now,row.target_user_id).run();
+  }
+  if(decision==="approved" && row.request_type==="role_change"){
+    const payload=JSON.parse(row.payload_json||"{}");
+    if(!isSupportedAccessRole(payload.accessRole))return json({error:"Invalid role."},400);
+    await db.prepare("UPDATE users SET access_role=?, role='agent', permissions_json=?, updated_at=? WHERE id=?").bind(payload.accessRole,JSON.stringify(payload.permissions||[]),now,row.target_user_id).run();
+  }
+  await db.prepare("UPDATE approval_requests SET status=?, reviewed_by=?, review_note=?, reviewed_at=? WHERE id=?").bind(decision,user.id,note,now,id).run();
+  await audit(db,user.id,"approval."+decision,{approvalId:id,type:row.request_type,targetUserId:row.target_user_id});
+  return json({ok:true,status:decision});
+}
+async function listStaff(user,env) {
+  if(user.role!=="admin")return json({error:"Only the administrator can view the staff directory."},403);
+  const q=await requireDatabase(env).prepare("SELECT * FROM users ORDER BY created_at ASC").all();
+  return json({staff:(q.results||[]).map(profileDto)});
+}
+async function createStaff(request,user,env) {
+  if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const email=normalizeEmail(parsed.body.email),name=String(parsed.body.displayName||"").trim(),role=String(parsed.body.accessRole||"agent");
+  if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
+  await db.prepare("INSERT INTO users (id,email,role,display_name,job_title,department,access_role,permissions_json,is_active,created_at,updated_at) VALUES (?,?,'agent',?,'','',?,'{}',1,?,?) ON CONFLICT(email) DO NOTHING").bind(id,email,name,role,now,now).run();
+  const row=await db.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
+  if(row.id!==id)return json({error:"This email is already registered."},409);
+  await audit(db,user.id,"staff.created",{staffId:id,email,accessRole:role});
+  return json({staff:profileDto(row)},201);
+}
+async function addEmployeeNote(request,user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Only the administrator can add employee notes."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const note=String(parsed.body.note||"").trim(),visibility=parsed.body.visibility==="employee_visible"?"employee_visible":"manager_only";
+  if(note.length<2||note.length>2000)return json({error:"Note must be between 2 and 2,000 characters."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
+  await db.prepare("INSERT INTO employee_notes (id,employee_id,author_id,note_text,visibility,created_at) VALUES (?,?,?,?,?,?)").bind(id,targetId,user.id,note,visibility,now).run();
+  await audit(db,user.id,"employee.note_added",{employeeId:targetId,visibility});
+  return json({ok:true,id},201);
+}
+async function listEmployeeNotes(user,env,targetId) {
+  if(user.role!=="admin"&&user.id!==targetId)return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare("SELECT n.*,u.display_name AS author_name FROM employee_notes n JOIN users u ON u.id=n.author_id WHERE n.employee_id=? AND (n.visibility='employee_visible' OR ?='admin') ORDER BY n.created_at DESC").bind(targetId,user.role).all();
+  return json({notes:q.results||[]});
+}
+async function managerDashboard(user,env) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  const db=requireDatabase(env);
+  const [staff,approvals,notes,auditRows]=await Promise.all([
+    db.prepare("SELECT COUNT(*) AS total, SUM(is_active) AS active FROM users").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM approval_requests WHERE status='pending'").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM employee_notes").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM audit_log").first()
+  ]);
+  return json({staff:staff?.total||0,activeStaff:staff?.active||0,pendingApprovals:approvals?.total||0,notes:notes?.total||0,auditEvents:auditRows?.total||0});
+}
+
 async function api(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -426,13 +527,28 @@ async function api(request, env) {
     if (path === "/api/auth/request-otp" && method === "POST") return await requestOtp(request, env);
     if (path === "/api/auth/verify-otp" && method === "POST") return await verifyOtp(request, env);
     if (path === "/api/auth/logout" && method === "POST") return await logout(request, env);
+    if (path === "/api/auth/me" && method === "GET") {
+      const me = await getSessionUser(request, env);
+      return me ? json({user:me}) : json({user:null},401);
+    }
 
     const user = await getSessionUser(request, env);
-    if (path === "/api/auth/me" && method === "GET") {
-      return user ? json({ user }) : json({ user: null }, 401);
-    }
     if (!user) return json({ error: "Sign in to access this workspace." }, 401);
 
+    if (path === "/api/profile" && method === "GET") return await profileMe(user,env);
+    if (path === "/api/profile/name-request" && method === "POST") return await createApproval(request,user,env);
+    if (path === "/api/manager/summary" && method === "GET") return await managerDashboard(user,env);
+    if (path === "/api/manager/staff" && method === "GET") return await listStaff(user,env);
+    if (path === "/api/manager/staff" && method === "POST") return await createStaff(request,user,env);
+    if (path === "/api/manager/approvals" && method === "GET") return await listApprovals(user,env);
+    if (path === "/api/manager/approvals" && method === "POST") {
+      const body=await request.clone().json().catch(()=>({}));
+      if(!body.id)return json({error:"Approval ID required."},400);
+      return await reviewApproval(request,user,env,String(body.id));
+    }
+    const noteMatch=path.match(/^\\/api\\/manager\\/staff\\/([A-Za-z0-9-]+)\\/notes$/);
+    if(noteMatch && method==="POST")return await addEmployeeNote(request,user,env,noteMatch[1]);
+    if(noteMatch && method==="GET")return await listEmployeeNotes(user,env,noteMatch[1]);
     if (path === "/api/cases" && method === "GET") return await listCases(user, env);
     if (path === "/api/cases" && method === "POST") return await createCase(request, user, env);
     if (path === "/api/reports/summary" && method === "GET") return await reportSummary(user, env);
