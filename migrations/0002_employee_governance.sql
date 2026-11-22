@@ -11,8 +11,12 @@ ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1
   CHECK (is_active IN (0, 1));
 
 UPDATE users
-SET access_role = 'admin'
-WHERE role = 'admin';
+SET role = 'agent', access_role = 'agent', permissions_json = '{}'
+WHERE lower(email) <> 'ishaymades2@gmail.com' AND role = 'admin';
+
+UPDATE users
+SET role = 'admin', access_role = 'admin'
+WHERE lower(email) = 'ishaymades2@gmail.com';
 
 UPDATE users
 SET display_name = CASE
