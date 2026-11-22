@@ -51,5 +51,5 @@ export function hasPermission(user, permission) {
   return permissions.includes("*") || permissions.includes(permission);
 }
 export function isSupportedAccessRole(role) {
-  return ["agent","supervisor","developer","admin"].includes(role);
+  return ["agent","supervisor","developer"].includes(role);
 }
