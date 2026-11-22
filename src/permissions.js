@@ -3,7 +3,7 @@ export const ROLE_PERMISSIONS = {
   admin: [
     "cases.view_all","cases.create","cases.update_all","cases.assign",
     "customers.view","customers.manage","tasks.view_all","tasks.manage",
-    "teams.view","teams.manage","reports.view_all","staff.view","staff.manage",
+    "teams.view","teams.manage","reports.view_all","reports.export","staff.view","staff.manage",
     "approvals.view","approvals.review","notes.manage","notifications.view",
     "knowledge.view","knowledge.manage","feedback.view","feedback.manage",
     "system.view_health","system.view_audit","system.view_integrations",
@@ -12,7 +12,7 @@ export const ROLE_PERMISSIONS = {
   supervisor: [
     "cases.view_team","cases.create","cases.update_team","cases.assign_team",
     "customers.view","tasks.view_team","tasks.manage_team","teams.view",
-    "reports.view_team","staff.view_team","approvals.view_team","notes.manage_team",
+    "reports.view_team","staff.view_team","approvals.view_team","approvals.review_team","notes.manage_team",
     "notifications.view","knowledge.view","feedback.view_team","profile.view",
     "profile.request_name_change"
   ],
@@ -34,7 +34,7 @@ export const ROLE_PERMISSIONS = {
   ],
 };
 
-export const VALID_PERMISSIONS = [...new Set(Object.values(ROLE_PERMISSIONS).flat().filter(p => p !== "*"))];
+export const VALID_PERMISSIONS = [...new Set([...Object.values(ROLE_PERMISSIONS).flat().filter(p => p !== "*"), "staff.manage_team"])];
 
 export function permissionsForUser(user) {
   if (!user) return [];

@@ -5,6 +5,7 @@ import {
   parseEmailList,
   roleForEmail,
   STATUSES,
+  TEAMS,
   validateCasePayload,
 } from "./validation.js";
 import { hasPermission, permissionsForUser, isSupportedAccessRole, VALID_PERMISSIONS } from "./permissions.js";
@@ -370,7 +371,7 @@ async function getSessionUser(request, env) {
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
   if (row.is_active === 0) return null;
-  return { id: row.id, email: row.email, role: row.role, isOwner: Boolean(row.is_owner), is_owner: row.is_owner, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
+  return { id: row.id, email: row.email, role: row.role, isOwner: Boolean(row.is_owner), is_owner: row.is_owner, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions_json: row.permissions_json, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -395,107 +396,330 @@ function caseDto(row) {
     createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    dueAt: row.due_at,
+    resolvedAt: row.resolved_at,
+    revision: row.revision,
+    assigneeName: row.assignee_name || "",
   };
 }
 
+const SLA_DEFAULTS = { Normal: 72, High: 24, Urgent: 4 };
+const SLA_KEYS = Object.keys(SLA_DEFAULTS).map(priority => `case_sla_${priority.toLowerCase()}_hours`);
+
+function teamList(user) {
+  return String(user.assignedTeam || "").split(",").map(value => value.trim()).filter(Boolean);
+}
+
+function caseScope(user, action, alias = "") {
+  if (user.isOwner || user.role === "admin" ||
+      (user.accessRole !== "developer" && hasPermission(user, `cases.${action}_all`))) {
+    return { sql: "1 = 1", args: [] };
+  }
+  const parts = [], args = [];
+  const teams = teamList(user);
+  if (teams.length && hasPermission(user, `cases.${action}_team`)) {
+    parts.push(`${alias}team IN (${teams.map(() => "?").join(",")})`);
+    args.push(...teams);
+  }
+  if (hasPermission(user, `cases.${action}_own`)) {
+    parts.push(`(${alias}created_by = ? OR ${alias}assigned_to = ?)`);
+    args.push(user.id, user.id);
+  }
+  return { sql: parts.length ? `(${parts.join(" OR ")})` : "0 = 1", args };
+}
+
+function scopedCase(db, user, id, action = "view") {
+  const scope = caseScope(user, action);
+  return db.prepare(`SELECT * FROM cases WHERE id = ? AND ${scope.sql}`).bind(id, ...scope.args).first();
+}
+
+async function slaHours(db) {
+  const query = await db.prepare("SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN (?, ?, ?)").bind(...SLA_KEYS).all();
+  const stored = Object.fromEntries((query.results || []).map(row => [row.setting_key, Number(row.setting_value)]));
+  return Object.fromEntries(Object.entries(SLA_DEFAULTS).map(([priority, fallback]) => [
+    priority, stored[`case_sla_${priority.toLowerCase()}_hours`] || fallback,
+  ]));
+}
+
 async function listCases(user, env) {
-  if(user.role!=="admin" && !hasPermission(user,"cases.view_own") && !hasPermission(user,"cases.view_team"))return json({error:"You do not have permission to view cases."},403);
   const db = requireDatabase(env);
-  const query = user.role === "admin"
-    ? await db.prepare(
-        "SELECT * FROM cases ORDER BY updated_at DESC LIMIT 200",
-      ).all()
-    : user.accessRole === "supervisor"
-      ? await db.prepare("SELECT * FROM cases WHERE team = ? ORDER BY updated_at DESC LIMIT 200").bind(user.assignedTeam || "").all()
-      : await db.prepare("SELECT * FROM cases WHERE created_by = ? OR assigned_to = ? ORDER BY updated_at DESC LIMIT 200").bind(user.id, user.id).all();
+  const scope = caseScope(user, "view", "c.");
+  const query = await db.prepare(
+    `SELECT c.*, u.display_name AS assignee_name FROM cases c LEFT JOIN users u ON u.id=c.assigned_to
+     WHERE ${scope.sql} ORDER BY c.updated_at DESC LIMIT 200`,
+  ).bind(...scope.args).all();
   return json({ cases: (query.results || []).map(caseDto) });
 }
 
+function caseEvent(db, actor, action, id, details, now, guard = "") {
+  return db.prepare(
+    `INSERT INTO audit_log (id, actor_id, action, case_id, details_json, created_at)
+     SELECT ?, ?, ?, ?, ?, ? ${guard ? "WHERE EXISTS (SELECT 1 FROM cases WHERE id=? AND last_change_id=?)" : ""}`,
+  ).bind(crypto.randomUUID(), actor.id, action, id, JSON.stringify(details), now, ...(guard ? [id, guard] : []));
+}
+
 async function createCase(request, user, env) {
-  if(!hasPermission(user,"cases.create"))return json({error:"You do not have permission to create cases."},403);
-  const settings = await requireDatabase(env).prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_new_cases'").first();
-  if (settings && settings.setting_value === "false") return json({ error: "New case creation is temporarily disabled by the system administrator." }, 423);
+  if (!hasPermission(user, "cases.create")) return json({ error: "Permission denied." }, 403);
+  const db = requireDatabase(env);
+  const settings = await db.prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_new_cases'").first();
+  if (settings?.setting_value === "false") return json({ error: "New case creation is temporarily disabled." }, 423);
   const parsed = await readJson(request);
   if (!parsed.ok) return parsed.response;
   const validated = validateCasePayload(parsed.body);
   if (!validated.ok) return json({ error: validated.error }, 400);
+  const value = validated.value;
+  if (user.accessRole === "supervisor" && !teamList(user).includes(value.team)) {
+    return json({ error: "Choose one of your assigned teams." }, 403);
+  }
 
-  const db = requireDatabase(env);
   const now = Math.floor(Date.now() / 1000);
   const id = `CX-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-  const value = validated.value;
-  if(user.accessRole==="supervisor") value.team=user.assignedTeam || "";
-  await db.prepare(
-    `INSERT INTO cases
-     (id, customer_name, category, priority, status, team, summary, assigned_to, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'Open', ?, ?, NULL, ?, ?, ?)`,
-  ).bind(id, value.customerName, value.category, value.priority, value.team, value.summary, user.id, now, now).run();
-
-  await db.prepare(
-    "INSERT INTO audit_log (id, actor_id, action, case_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).bind(crypto.randomUUID(), user.id, "case.created", id, JSON.stringify({ category: value.category, priority: value.priority }), now).run();
-
-  const row = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(id).first();
-  return json({ case: caseDto(row) }, 201);
+  const due = now + (await slaHours(db))[value.priority] * 3600;
+  await db.batch([
+    db.prepare(`INSERT INTO cases (id, customer_name, category, priority, status, team, summary, created_by, created_at, updated_at, due_at)
+      VALUES (?, ?, ?, ?, 'Open', ?, ?, ?, ?, ?, ?)`)
+      .bind(id, value.customerName, value.category, value.priority, value.team, value.summary, user.id, now, now, due),
+    caseEvent(db, user, "case.created", id, { priority: value.priority, team: value.team, dueAt: due }, now),
+  ]);
+  return json({ case: caseDto(await scopedCase(db, user, id, "view") ||
+    await db.prepare("SELECT * FROM cases WHERE id=?").bind(id).first()) }, 201);
 }
 
-async function updateCase(request, user, env, caseId) {
-  if(user.role!=="admin" && !hasPermission(user,"cases.update_own") && !hasPermission(user,"cases.update_team"))return json({error:"You do not have permission to update cases."},403);
-  const parsed = await readJson(request, 4_000);
+async function prepareCaseChange(db, user, row, body, now) {
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (reason.length > 2000) return { error: "Reason is too long." };
+  if (body.revision !== undefined && body.revision !== row.revision) return { error: "Case changed. Reload and try again.", status: 409 };
+  const manage = user.isOwner || user.role === "admin" ||
+    (hasPermission(user, "cases.assign_team") && teamList(user).includes(row.team));
+  const status = body.status ?? row.status;
+  const priority = body.priority ?? row.priority;
+  const team = body.team ?? row.team;
+  const assignee = body.assignedTo === "" ? null : (body.assignedTo === undefined ? row.assigned_to : body.assignedTo);
+  let due = body.dueAt === undefined ? row.due_at : body.dueAt;
+  if (priority !== row.priority && body.dueAt === undefined) due = row.created_at + (await slaHours(db))[priority] * 3600;
+  if (!STATUSES.includes(status) || !Object.hasOwn(SLA_DEFAULTS, priority) ||
+      (team !== row.team && !TEAMS.includes(team)) ||
+      (due !== null && (!Number.isSafeInteger(due) || due < 1))) return { error: "Check status, priority, team and deadline." };
+  const assignmentChanged = team !== row.team || assignee !== row.assigned_to;
+  if ((assignmentChanged || priority !== row.priority || due !== row.due_at) && !manage) return { error: "Manager access required.", status: 403 };
+  if (team !== row.team && user.role !== "admin" && !user.isOwner && !teamList(user).includes(team)) {
+    return { error: "Choose one of your assigned teams.", status: 403 };
+  }
+  if (assignmentChanged && assignee !== null) {
+    if (typeof assignee !== "string" || assignee.length > 80) return { error: "Invalid assignee." };
+    const target = await db.prepare("SELECT is_active, role, assigned_team FROM users WHERE id=?").bind(assignee).first();
+    if (!target?.is_active || (target.role !== "admin" && !teamList({assignedTeam: target.assigned_team}).includes(team))) {
+      return { error: "Choose an active team member." };
+    }
+  }
+  if (assignmentChanged && row.assigned_to && !reason) return { error: "Enter a reason for the transfer." };
+  const reopening = row.status === "Resolved" && status !== "Resolved";
+  const resolving = row.status !== "Resolved" && status === "Resolved";
+  if ((reopening || resolving) && !reason) return { error: "Enter a reason to resolve or reopen this case." };
+  const old = { status: row.status, priority: row.priority, team: row.team, assignedTo: row.assigned_to, dueAt: row.due_at };
+  const next = { status, priority, team, assignedTo: assignee, dueAt: due };
+  const changes = Object.fromEntries(Object.keys(next).filter(key => next[key] !== old[key]).map(key => [key, { from: old[key], to: next[key] }]));
+  if (!Object.keys(changes).length) return { statements: [] };
+  const changeId = crypto.randomUUID();
+  const statements = [
+    db.prepare(`UPDATE cases SET status=?, priority=?, team=?, assigned_to=?, due_at=?, updated_at=?,
+      first_response_at=?, resolved_at=?, reopen_count=reopen_count+?, revision=revision+1, last_change_id=?
+      WHERE id=? AND revision=?`)
+      .bind(status, priority, team, assignee, due, now, row.first_response_at ?? (status !== "Open" ? now : null),
+        resolving ? now : reopening ? null : row.resolved_at, reopening ? 1 : 0, changeId, row.id, row.revision),
+    caseEvent(db, user, "case.updated", row.id, { changes, reason }, now, changeId),
+  ];
+  if (assignee && assignee !== row.assigned_to) {
+    statements.push(db.prepare(`INSERT INTO notifications(id,user_id,title,body,kind,link,created_at)
+      SELECT ?,?,?,?,'case',?,? WHERE EXISTS (SELECT 1 FROM cases WHERE id=? AND last_change_id=?)`)
+      .bind(crypto.randomUUID(), assignee, "Case assigned", row.id, `/?case=${row.id}`, now, row.id, changeId));
+  }
+  return { statements };
+}
+
+async function updateCases(request, user, env, caseId) {
+  const parsed = await readJson(request, 12_000);
   if (!parsed.ok) return parsed.response;
-  const status = String(parsed.body.status || "");
-  if (!STATUSES.includes(status)) return json({ error: "Choose a valid case status." }, 400);
+  const ids = caseId ? [caseId] : parsed.body.ids;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 20 || ids.some(id => typeof id !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(id))) {
+    return json({ error: "Select between 1 and 20 cases." }, 400);
+  }
+  if (!caseId && !(user.isOwner || user.role === "admin" || hasPermission(user, "cases.assign_team"))) {
+    return json({ error: "Manager access required." }, 403);
+  }
+  const db = requireDatabase(env), now = Math.floor(Date.now() / 1000);
+  const batches = [];
+  for (const id of new Set(ids)) {
+    const row = await scopedCase(db, user, id, "update");
+    if (!row) return json({ error: "Case not found or unavailable." }, 404);
+    const change = await prepareCaseChange(db, user, row, parsed.body, now);
+    if (change.error) return json({ error: change.error, caseId: id }, change.status || 400);
+    if (change.statements.length) batches.push({ id, statements: change.statements });
+  }
+  if (batches.length) {
+    const result = await db.batch(batches.flatMap(change => change.statements));
+    const conflicted = [];
+    let index = 0;
+    for (const change of batches) {
+      if (!result[index]?.meta?.changes) conflicted.push(change.id);
+      index += change.statements.length;
+    }
+    if (conflicted.length) return json({ error: "Some cases changed before saving. Reload and review the results.", conflicted }, 409);
+  }
+  return caseId ? json({ case: caseDto(await db.prepare("SELECT * FROM cases WHERE id=?").bind(caseId).first()) }) : json({ updated: batches.length });
+}
 
+async function caseDetail(request, user, env, id, method) {
   const db = requireDatabase(env);
-  const row = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(caseId).first();
-  if (!row) return json({ error: "Case not found." }, 404);
-  const canUpdate = user.role === "admin"
-    || (user.accessRole === "supervisor" && row.team === user.assignedTeam && hasPermission(user,"cases.update_team"))
-    || (user.accessRole !== "supervisor" && (row.created_by === user.id || row.assigned_to === user.id) && hasPermission(user,"cases.update_own"));
-  if (!canUpdate) return json({ error: "You do not have permission to update this case." }, 403);
+  const row = await scopedCase(db, user, id, method === "POST" ? "update" : "view");
+  if (!row) return json({ error: "Case not found or unavailable." }, 404);
+  if (method === "POST") {
+    const parsed = await readJson(request, 6000);
+    if (!parsed.ok) return parsed.response;
+    const body = typeof parsed.body.note === "string" ? parsed.body.note.trim() : "";
+    if (!body || body.length > 2000) return json({ error: "Enter a note up to 2,000 characters." }, 400);
+    const now = Math.floor(Date.now() / 1000);
+    await db.batch([
+      db.prepare("INSERT INTO case_comments(id,case_id,author_id,body,created_at) VALUES(?,?,?,?,?)").bind(crypto.randomUUID(), id, user.id, body, now),
+      db.prepare("UPDATE cases SET updated_at=?,first_response_at=COALESCE(first_response_at,?),revision=revision+1 WHERE id=?").bind(now, now, id),
+      caseEvent(db, user, "case.note_added", id, {}, now),
+    ]);
+    return json({ ok: true }, 201);
+  }
+  const [events, notes, files] = await db.batch([
+    db.prepare("SELECT a.action,a.details_json,a.created_at,u.display_name AS actor FROM audit_log a JOIN users u ON u.id=a.actor_id WHERE a.case_id=? ORDER BY a.created_at DESC LIMIT 100").bind(id),
+    db.prepare("SELECT c.body,c.created_at,u.display_name AS author FROM case_comments c JOIN users u ON u.id=c.author_id WHERE c.case_id=? ORDER BY c.created_at DESC LIMIT 100").bind(id),
+    db.prepare("SELECT id,file_name,content_type,size_bytes,created_at,content_base64 IS NOT NULL AS downloadable FROM case_attachments WHERE case_id=? ORDER BY created_at DESC LIMIT 100").bind(id),
+  ]);
+  return json({ case: caseDto(row), events: events.results || [], notes: notes.results || [], attachments: files.results || [] });
+}
 
+async function caseAttachment(request, user, env, caseId, attachmentId) {
+  const db = requireDatabase(env);
+  const row = await scopedCase(db, user, caseId, attachmentId ? "view" : "update");
+  if (!row) return json({error:"Case not found or unavailable."},404);
+  if (attachmentId) {
+    const file = await db.prepare("SELECT file_name,content_base64 FROM case_attachments WHERE id=? AND case_id=?").bind(attachmentId,caseId).first();
+    if (!file?.content_base64) return json({error:"Attachment content is unavailable."},404);
+    const filename = encodeURIComponent(file.file_name).replace(/['()*]/g, char => "%" + char.charCodeAt(0).toString(16));
+    return new Response(Uint8Array.from(atob(file.content_base64), char => char.charCodeAt(0)), {
+      headers:{...SECURITY_HEADERS,"Content-Type":"application/octet-stream","Content-Disposition":"attachment; filename*=UTF-8''"+filename},
+    });
+  }
+  const parsed = await readJson(request, 360_000);
+  if (!parsed.ok) return parsed.response;
+  const { name, type, content } = parsed.body;
+  const allowedTypes = ["application/pdf","image/png","image/jpeg","text/plain"];
+  if (typeof name !== "string" || !name.trim() || name.length > 180 || /[\u0000-\u001f]/.test(name) ||
+      !allowedTypes.includes(type) || typeof content !== "string" || content.length > 350000 ||
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(content)) {
+    return json({error:"Choose a PDF, PNG, JPG or text file up to 256 KB."},400);
+  }
+  let bytes;
+  try { bytes = atob(content).length; } catch { return json({error:"Invalid attachment."},400); }
+  if (!bytes || bytes > 256 * 1024) return json({error:"Choose an attachment up to 256 KB."},400);
+  const id = crypto.randomUUID(), now = Math.floor(Date.now()/1000);
+  await db.batch([
+    db.prepare(`INSERT INTO case_attachments(id,case_id,uploaded_by,file_name,content_type,object_key,size_bytes,created_at,content_base64)
+      VALUES(?,?,?,?,?,?,?,?,?)`).bind(id,caseId,user.id,name,type,id,bytes,now,content),
+    caseEvent(db,user,"case.attachment_added",caseId,{name},now),
+  ]);
+  return json({ok:true,id},201);
+}
+
+async function managerOperations(request, user, env) {
+  if (!(user.isOwner || user.role === "admin" || hasPermission(user, "cases.assign_team"))) {
+    return json({ error: "Manager access required." }, 403);
+  }
+  const db = requireDatabase(env);
+  if (request.method === "PUT") {
+    if (!user.isOwner) return json({ error: "Owner access required." }, 403);
+    const parsed = await readJson(request, 1500);
+    if (!parsed.ok) return parsed.response;
+    const values = Object.keys(SLA_DEFAULTS).map(priority => parsed.body[priority]);
+    if (values.some(value => !Number.isSafeInteger(value) || value < 1 || value > 720)) {
+      return json({ error: "Set each deadline between 1 and 720 hours." }, 400);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    await db.batch([
+      ...SLA_KEYS.map((key, index) => db.prepare("UPDATE system_settings SET setting_value=?,updated_by=?,updated_at=? WHERE setting_key=?").bind(String(values[index]), user.id, now, key)),
+      audit(db, user.id, "case.sla_updated", parsed.body),
+    ]);
+    return json({ ok: true });
+  }
+  const scope = caseScope(user, "view", "c.");
   const now = Math.floor(Date.now() / 1000);
-  await db.prepare("UPDATE cases SET status = ?, updated_at = ? WHERE id = ?")
-    .bind(status, now, caseId).run();
-  await db.prepare(
-    "INSERT INTO audit_log (id, actor_id, action, case_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).bind(crypto.randomUUID(), user.id, "case.status_updated", caseId, JSON.stringify({ from: row.status, to: status }), now).run();
-
-  const updated = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(caseId).first();
-  return json({ case: caseDto(updated) });
+  const day = 86400, start = Math.floor((now + 14400) / day) * day - 14400;
+  const [stats, workload, attention, staff] = await db.batch([
+    db.prepare(`SELECT COUNT(CASE WHEN c.created_at>=? THEN 1 END) AS newToday,
+      COUNT(CASE WHEN c.status!='Resolved' AND c.due_at<? THEN 1 END) AS overdue,
+      COUNT(CASE WHEN c.status!='Resolved' AND c.due_at BETWEEN ? AND ? THEN 1 END) AS dueSoon,
+      COUNT(CASE WHEN c.status!='Resolved' THEN 1 END) AS pending,
+      COUNT(CASE WHEN c.resolved_at>=? THEN 1 END) AS resolvedToday FROM cases c WHERE ${scope.sql}`)
+      .bind(start, now, now, now + day, start, ...scope.args),
+    db.prepare(`SELECT u.display_name AS name,COUNT(*) AS active,SUM(c.priority='Urgent') AS urgent FROM cases c
+      LEFT JOIN users u ON u.id=c.assigned_to WHERE ${scope.sql} AND c.status!='Resolved' GROUP BY c.assigned_to ORDER BY active DESC`).bind(...scope.args),
+    db.prepare(`SELECT c.* FROM cases c WHERE ${scope.sql} AND c.status!='Resolved'
+      AND (c.due_at<=? OR (c.priority='Urgent' AND c.assigned_to IS NULL) OR c.updated_at<=?)
+      ORDER BY COALESCE(c.due_at,2147483647),c.updated_at LIMIT 50`).bind(...scope.args, now + day, now - 2 * day),
+    db.prepare("SELECT id,display_name,assigned_team,role FROM users WHERE is_active=1 ORDER BY display_name"),
+  ]);
+  const teams = teamList(user), all = user.isOwner || user.role === "admin";
+  return json({ stats: stats.results[0], workload: workload.results, attention: attention.results.map(caseDto),
+    staff: staff.results.filter(row => all || teamList({assignedTeam: row.assigned_team}).some(team => teams.includes(team))),
+    sla: user.isOwner ? await slaHours(db) : null });
 }
 
-async function reportSummary(user, env) {
-  if(user.role!=="admin" && !hasPermission(user,"reports.view_own") && !hasPermission(user,"reports.view_team"))return json({error:"You do not have permission to view reports."},403);
+async function reportSummary(user, env, url) {
   const db = requireDatabase(env);
-  const baseSql = user.role === "admin"
-    ? "SELECT status, category, created_at FROM cases"
-    : user.accessRole === "supervisor"
-      ? "SELECT status, category, created_at FROM cases WHERE team = ?"
-      : "SELECT status, category, created_at FROM cases WHERE created_by = ? OR assigned_to = ?";
-  const stmt = db.prepare(baseSql);
-  const result = user.role === "admin" ? await stmt.all() : user.accessRole === "supervisor" ? await stmt.bind(user.assignedTeam || "").all() : await stmt.bind(user.id, user.id).all();
-  const rows = result.results || [];
-  const total = rows.length;
-  const resolved = rows.filter((row) => row.status === "Resolved").length;
-  const inProgress = rows.filter((row) => row.status === "In progress").length;
-  const open = rows.filter((row) => row.status === "Open").length;
-  const byCategory = {};
-  for (const row of rows) byCategory[row.category] = (byCategory[row.category] || 0) + 1;
-  const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
-  const createdLast30Days = rows.filter((row) => row.created_at >= thirtyDaysAgo).length;
-  return json({
-    total,
-    resolved,
-    open,
-    inProgress,
-    resolutionRate: total ? Math.round((resolved / total) * 1000) / 10 : 0,
-    createdLast30Days,
-    byCategory,
-    source: "database",
-  });
+  const scope = caseScope(user, "view");
+  if (!["own", "team", "all"].some(level => hasPermission(user, `reports.view_${level}`)) && !user.isOwner) {
+    return json({ error: "Permission denied." }, 403);
+  }
+  const team = url.searchParams.get("team") || "";
+  const category = url.searchParams.get("category") || "";
+  const date = name => {
+    const value = url.searchParams.get(name);
+    return value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(`${value}T00:00:00+04:00`) / 1000 : null;
+  };
+  const from = date("from"), to = date("to");
+  if ((url.searchParams.has("from") && !Number.isFinite(from)) ||
+      (url.searchParams.has("to") && !Number.isFinite(to)) || (from !== null && to !== null && from > to)) {
+    return json({ error: "Check report dates." }, 400);
+  }
+  const where = `${scope.sql} AND (?='' OR team=?) AND (?='' OR category=?)
+    AND (? IS NULL OR created_at>=?) AND (? IS NULL OR created_at<?)`;
+  const args = [...scope.args, team, team, category, category, from, from, to, to === null ? null : to + 86400];
+  if (url.searchParams.get("format") === "csv") {
+    const setting = await db.prepare("SELECT setting_value FROM system_settings WHERE setting_key='case_export_enabled'").first();
+    if (setting?.setting_value === "false" || !hasPermission(user, "reports.export")) return json({ error: "Export is unavailable." }, 403);
+    const result = await db.prepare(`SELECT id,customer_name,category,priority,status,team,created_at,due_at,first_response_at,resolved_at,reopen_count FROM cases WHERE ${where} ORDER BY created_at DESC LIMIT 10001`).bind(...args).all();
+    if (result.results.length > 10000) return json({ error: "Narrow the date range to export fewer than 10,001 cases." }, 400);
+    const csv = value => '"' + String(value ?? "").replace(/^[\s]*[=+\-@\t\r]/, match => "'" + match).replaceAll('"','""') + '"';
+    const columns = ["id","customer_name","category","priority","status","team","created_at","due_at","first_response_at","resolved_at","reopen_count"];
+    const body = [columns, ...result.results.map(row => columns.map(key => row[key]))].map(row => row.map(csv).join(",")).join("\r\n");
+    return new Response("\ufeff" + body, { headers: { ...SECURITY_HEADERS, "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": 'attachment; filename="cx-pulse-report.csv"' } });
+  }
+  const recent = Math.floor(Date.now()/1000) - 30*86400;
+  const [summary, categories, teams] = await db.batch([
+    db.prepare(`SELECT COUNT(*) AS total,COUNT(CASE WHEN status='Resolved' THEN 1 END) AS resolved,
+      COUNT(CASE WHEN status='Open' THEN 1 END) AS open,COUNT(CASE WHEN status='In progress' THEN 1 END) AS inProgress,
+      COUNT(CASE WHEN created_at>=? THEN 1 END) AS createdLast30Days,COUNT(first_response_at) AS firstResponseSample,
+      AVG(first_response_at-created_at) AS firstResponseSeconds,COUNT(resolved_at) AS resolutionSample,
+      AVG(resolved_at-created_at) AS resolutionSeconds,
+      COUNT(CASE WHEN resolved_at IS NOT NULL AND due_at IS NOT NULL THEN 1 END) AS slaSample,
+      COUNT(CASE WHEN resolved_at<=due_at THEN 1 END) AS metSla,COALESCE(SUM(reopen_count),0) AS reopened
+      FROM cases WHERE ${where}`).bind(recent,...args),
+    db.prepare(`SELECT category,COUNT(*) AS total FROM cases WHERE ${where} GROUP BY category ORDER BY total DESC`).bind(...args),
+    db.prepare(`SELECT team,COUNT(*) AS total,COUNT(first_response_at) AS firstResponseSample,
+      AVG(first_response_at-created_at) AS firstResponseSeconds,COUNT(resolved_at) AS resolutionSample,
+      AVG(resolved_at-created_at) AS resolutionSeconds FROM cases WHERE ${where} GROUP BY team ORDER BY total DESC`).bind(...args),
+  ]);
+  const data = summary.results[0];
+  return json({ ...data, resolutionRate: data.total ? Math.round(data.resolved / data.total * 1000) / 10 : 0,
+    byCategory: Object.fromEntries(categories.results.map(row => [row.category,row.total])), byTeam: teams.results,
+    canExport: hasPermission(user, "reports.export"), source: "database" });
 }
-
 
 function audit(db, actorId, action, details = {}) {
   const now = Math.floor(Date.now() / 1000);
@@ -522,37 +746,60 @@ async function createApproval(request, user, env) {
   await audit(db,user.id,"approval.requested",{approvalId:id,type});
   return json({ ok:true, requestId:id },201);
 }
+function inManagedTeam(user, assignedTeam) {
+  return teamList({ assignedTeam }).some(team => teamList(user).includes(team));
+}
+
 async function listApprovals(user, env) {
-  if (!hasPermission(user,"staff.view")) return json({error:"Permission denied."},403);
-  const q=await requireDatabase(env).prepare(`SELECT a.*, u.email AS requester_email, u.display_name AS requester_name FROM approval_requests a JOIN users u ON u.id=a.requester_id ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 200`).all();
-  return json({requests:q.results||[]});
+  const all = user.role === "admin" || user.isOwner;
+  if (!all && !hasPermission(user, "approvals.view_team")) return json({error:"Permission denied."},403);
+  const db = requireDatabase(env);
+  const rows = (await db.prepare(`SELECT a.*, u.email AS requester_email, u.display_name AS requester_name, u.assigned_team
+    FROM approval_requests a JOIN users u ON u.id=a.requester_id
+    ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.created_at DESC`).all()).results;
+  return json({requests:rows.filter(row => all || (row.request_type === "name_change" && inManagedTeam(user,row.assigned_team))).slice(0,200),
+    canReview:all || hasPermission(user,"approvals.review_team")});
 }
 async function reviewApproval(request,user,env,id) {
-  if (user.role!=="admin") return json({error:"Only the administrator can approve requests."},403);
+  const all = user.role === "admin" || user.isOwner;
+  if (!all && !hasPermission(user,"approvals.review_team")) return json({error:"Permission denied."},403);
   const parsed=await readJson(request,3000); if(!parsed.ok)return parsed.response;
-  const db=requireDatabase(env), row=await db.prepare("SELECT * FROM approval_requests WHERE id=?").bind(id).first();
-  if(!row)return json({error:"Request not found."},404);
+  const db=requireDatabase(env);
+  const row=await db.prepare(`SELECT a.*,u.assigned_team,u.role,u.is_owner FROM approval_requests a
+    JOIN users u ON u.id=a.target_user_id WHERE a.id=?`).bind(id).first();
+  if(!row || (!all && (row.request_type!=="name_change" || row.is_owner || row.role==="admin" || !inManagedTeam(user,row.assigned_team)))) {
+    return json({error:"Request not found or unavailable."},404);
+  }
   if(row.status!=="pending")return json({error:"This request has already been reviewed."},409);
   const decision=String(parsed.body.decision||""), note=String(parsed.body.note||"").trim();
-  if(!["approved","rejected"].includes(decision))return json({error:"Choose approve or reject."},400);
-  const now=Math.floor(Date.now()/1000);
+  if(!["approved","rejected"].includes(decision) || note.length>2000)return json({error:"Choose approve or reject and check the review note."},400);
+  const now=Math.floor(Date.now()/1000), reviewId=crypto.randomUUID();
+  const guard="EXISTS (SELECT 1 FROM approval_requests WHERE id=? AND status=? AND reviewed_by=? AND review_token=?)";
+  const bindGuard=[id,decision,user.id,reviewId];
+  const statements=[db.prepare("UPDATE approval_requests SET status=?,reviewed_by=?,review_note=?,reviewed_at=?,review_token=? WHERE id=? AND status='pending'")
+    .bind(decision,user.id,note,now,reviewId,id)];
   if(decision==="approved" && row.request_type==="name_change"){
     const payload=JSON.parse(row.payload_json||"{}");
-    await db.prepare("UPDATE users SET display_name=?, updated_at=? WHERE id=?").bind(payload.displayName,now,row.target_user_id).run();
+    statements.push(db.prepare(`UPDATE users SET display_name=?,updated_at=? WHERE id=? AND ${guard}`).bind(payload.displayName,now,row.target_user_id,...bindGuard));
   }
   if(decision==="approved" && row.request_type==="role_change"){
     const payload=JSON.parse(row.payload_json||"{}");
-    if(!isSupportedAccessRole(payload.accessRole))return json({error:"Invalid role."},400);
-    await db.prepare("UPDATE users SET access_role=?, role='agent', permissions_json=?, updated_at=? WHERE id=?").bind(payload.accessRole,JSON.stringify(payload.permissions||[]),now,row.target_user_id).run();
+    if(!user.isOwner || row.is_owner || !isSupportedAccessRole(payload.accessRole))return json({error:"Only an owner can approve a valid staff role change."},403);
+    statements.push(db.prepare(`UPDATE users SET access_role=?,role='agent',permissions_json=?,updated_at=? WHERE id=? AND ${guard}`)
+      .bind(payload.accessRole,JSON.stringify(payload.permissions||[]),now,row.target_user_id,...bindGuard));
   }
-  await db.prepare("UPDATE approval_requests SET status=?, reviewed_by=?, review_note=?, reviewed_at=? WHERE id=?").bind(decision,user.id,note,now,id).run();
-  await audit(db,user.id,"approval."+decision,{approvalId:id,type:row.request_type,targetUserId:row.target_user_id});
+  statements.push(db.prepare(`INSERT INTO audit_log(id,actor_id,action,details_json,created_at)
+    SELECT ?,?,?,?,? WHERE ${guard}`).bind(crypto.randomUUID(),user.id,"approval."+decision,JSON.stringify({approvalId:id}),now,...bindGuard));
+  const [result]=await db.batch(statements);
+  if(!result.meta.changes)return json({error:"This request has already been reviewed."},409);
   return json({ok:true,status:decision});
 }
 async function listStaff(user,env) {
-  if(user.role!=="admin")return json({error:"Only the administrator can view the staff directory."},403);
+  const all=user.role==="admin"||user.isOwner;
+  if(!all&&!hasPermission(user,"staff.view_team"))return json({error:"Permission denied."},403);
   const q=await requireDatabase(env).prepare("SELECT * FROM users ORDER BY created_at ASC").all();
-  return json({staff:(q.results||[]).map(profileDto)});
+  return json({staff:(q.results||[]).filter(row=>all||(!row.is_owner&&row.role!=="admin"&&inManagedTeam(user,row.assigned_team))).map(profileDto),
+    canManage:all||hasPermission(user,"staff.manage_team")});
 }
 async function createStaff(request,user,env) {
   if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
@@ -607,7 +854,8 @@ async function updateOwnProfile(request,user,env) {
   return json({ok:true,displayName:name});
 }
 async function managerUpdateStaff(request,user,env,targetId) {
-  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  const all=user.role==="admin"||user.isOwner;
+  if(!all&&!hasPermission(user,"staff.manage_team"))return json({error:"Manager access required."},403);
   const parsed=await readJson(request,5000);if(!parsed.ok)return parsed.response;
   const body=parsed.body,role=String(body.accessRole||"agent"),name=String(body.displayName||"").trim(),team=String(body.assignedTeam||"").trim();
   if((!["agent","supervisor","developer"].includes(role)&&!(role==="admin"&&user.isOwner))||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team. Only the owner may appoint an administrator."},400);
@@ -616,6 +864,15 @@ async function managerUpdateStaff(request,user,env,targetId) {
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
   const current=await db.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
   if(!current)return json({error:"Employee not found."},404);
+  if(current.is_owner || (!user.isOwner && (current.role==="admin" || role !== current.access_role || custom !== undefined && !all))) {
+    return json({error:"This profile or permission change requires the owner."},403);
+  }
+  if(!all && (!inManagedTeam(user,current.assigned_team) ||
+      teamList({assignedTeam:current.assigned_team}).some(value=>!teamList(user).includes(value)) ||
+      !teamList({assignedTeam:team}).length || teamList({assignedTeam:team}).some(value=>!teamList(user).includes(value)))) {
+    return json({error:"This employee is outside your managed teams."},403);
+  }
+
   const perms=custom===undefined?current.permissions_json:JSON.stringify([...new Set(custom)]);
   await db.prepare("UPDATE users SET display_name=?,access_role=?,permissions_json=?,assigned_team=?,updated_at=? WHERE id=?").bind(name,role,perms,team,now,targetId).run();
   await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
@@ -627,8 +884,9 @@ async function managerDeactivateStaff(user,env,targetId) {
   if(user.role!=="admin")return json({error:"Administrator access required."},403);
   if(user.id===targetId)return json({error:"You cannot disable your own administrator account."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
-  const row=await db.prepare("SELECT id,email FROM users WHERE id=?").bind(targetId).first();
+  const row=await db.prepare("SELECT id,email,is_owner FROM users WHERE id=?").bind(targetId).first();
   if(!row)return json({error:"Employee not found."},404);
+  if(row.is_owner)return json({error:"Owner accounts cannot be disabled here."},403);
   await db.prepare("UPDATE users SET is_active=0,updated_at=? WHERE id=?").bind(now,targetId).run();
   await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
   await audit(db,user.id,"staff.disabled",{targetUserId:targetId,email:row.email});
@@ -728,10 +986,17 @@ async function api(request, env) {
     if(noteMatch && method==="GET")return await listEmployeeNotes(user,env,noteMatch[1]);
     if (path === "/api/cases" && method === "GET") return await listCases(user, env);
     if (path === "/api/cases" && method === "POST") return await createCase(request, user, env);
-    if (path === "/api/reports/summary" && method === "GET") return await reportSummary(user, env);
+    if (path === "/api/reports/summary" && method === "GET") return await reportSummary(user, env, url);
 
+    if (path === "/api/manager/operations" && ["GET","PUT"].includes(method)) return await managerOperations(request, user, env);
+    if (path === "/api/cases/bulk" && method === "PATCH") return await updateCases(request, user, env);
+    const attachment = path.match(/^\/api\/cases\/([A-Za-z0-9-]+)\/attachments(?:\/([A-Za-z0-9-]+))?$/);
+    if (attachment && ((attachment[2] && method === "GET") || (!attachment[2] && method === "POST"))) {
+      return await caseAttachment(request, user, env, attachment[1], attachment[2]);
+    }
     const match = path.match(/^\/api\/cases\/([A-Za-z0-9-]+)$/);
-    if (match && method === "PATCH") return await updateCase(request, user, env, match[1]);
+    if (match && method === "PATCH") return await updateCases(request, user, env, match[1]);
+    if (match && ["GET","POST"].includes(method)) return await caseDetail(request, user, env, match[1], method);
 
     return json({ error: "Endpoint not found." }, 404);
   } catch (error) {

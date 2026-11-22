@@ -45,7 +45,15 @@ export async function handleEnterpriseApi(req,user,env){
   const can=allowed(user,"tasks.manage")||allowed(user,"tasks.manage_team")&&row.team===user.assignedTeam||allowed(user,"tasks.update_own")&&(row.assigned_to===user.id||row.created_by===user.id);if(!can)return denied();
   const status=["Open","In progress","Done","Cancelled"].includes(b.status)?b.status:row.status;await db.prepare("UPDATE tasks SET status=?,updated_at=? WHERE id=?").bind(status,now(),tid).run();await audit(db,user,"task.updated",{taskId:tid,status});return json({ok:true});
  }
- if(p==="/api/notifications"&&m==="GET"){if(!allowed(user,"notifications.view"))return denied();const q=await db.prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();return json({notifications:q.results||[]})}
+ if(p==="/api/notifications"&&m==="GET"){
+  if(!allowed(user,"notifications.view"))return denied();
+  const [saved,due]=await db.batch([
+   db.prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id),
+   db.prepare("SELECT id,due_at FROM cases WHERE assigned_to=? AND status!='Resolved' AND due_at<=? ORDER BY due_at LIMIT 30").bind(user.id,now()+86400)
+  ]);
+  const reminders=(due.results||[]).map(item=>({id:"deadline-"+item.id,kind:"deadline",title:item.due_at<now()?"Case overdue":"Case due within 24 hours",body:item.id,link:"/?case="+item.id,created_at:item.due_at}));
+  return json({notifications:[...reminders,...(saved.results||[])]});
+ }
  if(p.startsWith("/api/notifications/")&&m==="PATCH"){const nid=p.split("/").pop();await db.prepare("UPDATE notifications SET read_at=? WHERE id=? AND user_id=?").bind(now(),nid,user.id).run();return json({ok:true})}
  if(p==="/api/knowledge"&&(m==="GET"||m==="POST")){
   if(!allowed(user,"knowledge.view")&&!allowed(user,"knowledge.manage"))return denied();
