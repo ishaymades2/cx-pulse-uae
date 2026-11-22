@@ -248,7 +248,7 @@ async function verifyOtp(request, env) {
     `INSERT INTO users (id, email, role, display_name, access_role, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at`,
-  ).bind(userId, email, role, email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
+  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
 
   const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active FROM users WHERE email = ?").bind(email).first();
   const token = randomToken();
