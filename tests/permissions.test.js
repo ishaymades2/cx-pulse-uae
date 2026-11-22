@@ -36,3 +36,18 @@ test("only supported non-admin roles can be assigned to staff", () => {
   assert.equal(isSupportedAccessRole("developer"), true);
   assert.equal(isSupportedAccessRole("admin"), false);
 });
+
+test("owner has immutable full permissions", () => {
+  const owner = { role: "admin", access_role: "admin", is_owner: 1 };
+  assert.equal(hasPermission(owner, "staff.manage"), true);
+  assert.equal(hasPermission(owner, "system.manage_backups"), true);
+});
+
+test("developer has broad operational access but is not owner", () => {
+  const developer = { role: "agent", access_role: "developer", permissions_json: "{}" };
+  assert.equal(hasPermission(developer, "cases.update_all"), true);
+  assert.equal(hasPermission(developer, "customers.manage"), true);
+  assert.equal(hasPermission(developer, "tasks.manage"), true);
+  assert.equal(hasPermission(developer, "staff.manage"), false);
+  assert.equal(hasPermission(developer, "ownership.transfer"), false);
+});
