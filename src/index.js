@@ -405,7 +405,7 @@ function audit(db, actorId, action, details = {}) {
     .bind(crypto.randomUUID(), actorId, action, JSON.stringify(details), now).run();
 }
 function profileDto(row) {
-  return { id: row.id, email: row.email, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, permissions: permissionsForUser(row), isActive: Boolean(row.is_active), createdAt: row.created_at };
+  return { id: row.id, email: row.email, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team || "", permissions: permissionsForUser(row), isActive: Boolean(row.is_active), createdAt: row.created_at };
 }
 async function profileMe(user, env) {
   const row = await requireDatabase(env).prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first();
