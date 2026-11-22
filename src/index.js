@@ -220,7 +220,8 @@ async function verifyOtp(request, env) {
   if (!parsed.ok) return parsed.response;
   const email = normalizeEmail(parsed.body.email);
   const code = String(parsed.body.code || "").trim();
-  if (!isAllowedEmail(email, env) || !/^\d{6}$/.test(code)) {
+  const eligible = isAllowedEmail(email, env) || Boolean(await db.prepare("SELECT id FROM users WHERE email = ? AND is_active = 1").bind(email).first());
+  if (!eligible || !/^\d{6}$/.test(code)) {
     return json({ error: "The code is invalid or has expired." }, 400);
   }
 
@@ -257,7 +258,7 @@ async function verifyOtp(request, env) {
   ).bind(tokenHash, user.id, now + SESSION_SECONDS, now, now).run();
 
   return withCookie(
-    json({ user: { id: user.id, email: user.email, role: user.role } }),
+    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role } }),
     sessionCookie(token),
   );
 }
@@ -269,7 +270,7 @@ async function getSessionUser(request, env) {
   const now = Math.floor(Date.now() / 1000);
   const db = requireDatabase(env);
   const row = await db.prepare(
-    `SELECT u.id, u.email, u.role, s.expires_at
+    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.assigned_team, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ?`,
   ).bind(tokenHash).first();
@@ -279,7 +280,7 @@ async function getSessionUser(request, env) {
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
   if (row.is_active === 0) return null;
-  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, permissions: permissionsForUser(row) };
+  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -313,9 +314,9 @@ async function listCases(user, env) {
     ? await db.prepare(
         "SELECT * FROM cases ORDER BY updated_at DESC LIMIT 200",
       ).all()
-    : await db.prepare(
-        "SELECT * FROM cases WHERE created_by = ? OR assigned_to = ? ORDER BY updated_at DESC LIMIT 200",
-      ).bind(user.id, user.id).all();
+    : user.accessRole === "supervisor"
+      ? await db.prepare("SELECT * FROM cases WHERE team = ? ORDER BY updated_at DESC LIMIT 200").bind(user.assignedTeam || "").all()
+      : await db.prepare("SELECT * FROM cases WHERE created_by = ? OR assigned_to = ? ORDER BY updated_at DESC LIMIT 200").bind(user.id, user.id).all();
   return json({ cases: (query.results || []).map(caseDto) });
 }
 
@@ -352,7 +353,7 @@ async function updateCase(request, user, env, caseId) {
   const db = requireDatabase(env);
   const row = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(caseId).first();
   if (!row) return json({ error: "Case not found." }, 404);
-  if (user.role !== "admin" && row.created_by !== user.id && row.assigned_to !== user.id) {
+  if (user.role !== "admin" && !(user.accessRole === "supervisor" && row.team === user.assignedTeam) && row.created_by !== user.id && row.assigned_to !== user.id) {
     return json({ error: "You do not have permission to update this case." }, 403);
   }
 
@@ -371,9 +372,11 @@ async function reportSummary(user, env) {
   const db = requireDatabase(env);
   const baseSql = user.role === "admin"
     ? "SELECT status, category, created_at FROM cases"
-    : "SELECT status, category, created_at FROM cases WHERE created_by = ? OR assigned_to = ?";
+    : user.accessRole === "supervisor"
+      ? "SELECT status, category, created_at FROM cases WHERE team = ?"
+      : "SELECT status, category, created_at FROM cases WHERE created_by = ? OR assigned_to = ?";
   const stmt = db.prepare(baseSql);
-  const result = user.role === "admin" ? await stmt.all() : await stmt.bind(user.id, user.id).all();
+  const result = user.role === "admin" ? await stmt.all() : user.accessRole === "supervisor" ? await stmt.bind(user.assignedTeam || "").all() : await stmt.bind(user.id, user.id).all();
   const rows = result.results || [];
   const total = rows.length;
   const resolved = rows.filter((row) => row.status === "Resolved").length;
@@ -492,6 +495,71 @@ async function managerDashboard(user,env) {
   return json({staff:staff?.total||0,activeStaff:staff?.active||0,pendingApprovals:approvals?.total||0,notes:notes?.total||0,auditEvents:auditRows?.total||0});
 }
 
+
+async function updateOwnProfile(request,user,env) {
+  if(user.role!=="admin") return json({error:"Only the administrator may edit this profile directly."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const name=String(parsed.body.displayName||"").trim();
+  if(name.length<2||name.length>80)return json({error:"Display name must be between 2 and 80 characters."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  await db.prepare("UPDATE users SET display_name=?,updated_at=? WHERE id=?").bind(name,now,user.id).run();
+  await audit(db,user.id,"profile.admin_name_updated",{displayName:name});
+  return json({ok:true,displayName:name});
+}
+async function managerUpdateStaff(request,user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  const parsed=await readJson(request,5000);if(!parsed.ok)return parsed.response;
+  const body=parsed.body,role=String(body.accessRole||"agent"),name=String(body.displayName||"").trim(),team=String(body.assignedTeam||"").trim();
+  if(!isSupportedAccessRole(role)||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team."},400);
+  const custom=body.permissions;
+  if(custom!==undefined && (!Array.isArray(custom)||custom.some(p=>!VALID_PERMISSIONS.includes(p))))return json({error:"One or more permissions are not supported."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  const current=await db.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  if(!current)return json({error:"Employee not found."},404);
+  const perms=custom===undefined?current.permissions_json:JSON.stringify([...new Set(custom)]);
+  await db.prepare("UPDATE users SET display_name=?,access_role=?,permissions_json=?,assigned_team=?,updated_at=? WHERE id=?").bind(name,role,perms,team,now,targetId).run();
+  await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
+  await audit(db,user.id,"staff.updated",{targetUserId:targetId,accessRole:role,assignedTeam:team});
+  const updated=await db.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  return json({staff:profileDto(updated)});
+}
+async function managerDeactivateStaff(user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  if(user.id===targetId)return json({error:"You cannot disable your own administrator account."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  const row=await db.prepare("SELECT id,email FROM users WHERE id=?").bind(targetId).first();
+  if(!row)return json({error:"Employee not found."},404);
+  await db.prepare("UPDATE users SET is_active=0,updated_at=? WHERE id=?").bind(now,targetId).run();
+  await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
+  await audit(db,user.id,"staff.disabled",{targetUserId:targetId,email:row.email});
+  return json({ok:true});
+}
+async function managerAudit(user,env) {
+  if(user.role!=="admin" && !hasPermission(user,"system.view_audit"))return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare("SELECT a.*,u.email,u.display_name FROM audit_log a JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT 200").all();
+  return json({events:q.results||[]});
+}
+async function developerSettings(user,env,method,request) {
+  if(!hasPermission(user,"system.view_integrations"))return json({error:"Permission denied."},403);
+  const db=requireDatabase(env);
+  if(method==="GET"){
+    const q=await db.prepare("SELECT setting_key,setting_value,updated_at FROM system_settings ORDER BY setting_key").all();
+    return json({settings:q.results||[]});
+  }
+  if(method==="PUT"){
+    if(!hasPermission(user,"system.manage_settings"))return json({error:"Permission denied."},403);
+    const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+    const key=String(parsed.body.key||""),value=String(parsed.body.value||"");
+    const allowed=new Set(["allow_new_cases","default_case_team","case_export_enabled"]);
+    if(!allowed.has(key)||value.length>100)return json({error:"Unsupported setting."},400);
+    const now=Math.floor(Date.now()/1000);
+    await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();
+    await audit(db,user.id,"system.setting_updated",{key,value});
+    return json({ok:true});
+  }
+  return json({error:"Method not allowed."},405);
+}
+
 async function api(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -536,6 +604,12 @@ async function api(request, env) {
     if (!user) return json({ error: "Sign in to access this workspace." }, 401);
 
     if (path === "/api/profile" && method === "GET") return await profileMe(user,env);
+    if (path === "/api/profile" && method === "PATCH") return await updateOwnProfile(request,user,env);
+    if (path === "/api/manager/audit" && method === "GET") return await managerAudit(user,env);
+    if (path === "/api/developer/settings" && (method === "GET" || method === "PUT")) return await developerSettings(user,env,method,request);
+    const staffMatch=path.match(/^\/api\/manager\/staff\/([A-Za-z0-9-]+)$/);
+    if(staffMatch && method==="PATCH")return await managerUpdateStaff(request,user,env,staffMatch[1]);
+    if(staffMatch && method==="DELETE")return await managerDeactivateStaff(user,env,staffMatch[1]);
     if (path === "/api/profile/name-request" && method === "POST") return await createApproval(request,user,env);
     if (path === "/api/manager/summary" && method === "GET") return await managerDashboard(user,env);
     if (path === "/api/manager/staff" && method === "GET") return await listStaff(user,env);
