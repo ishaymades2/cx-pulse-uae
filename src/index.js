@@ -1,3 +1,4 @@
+import { handleEnterpriseApi } from "./enterprise.js";
 import {
   isAllowedEmail,
   normalizeEmail,
@@ -243,14 +244,15 @@ async function verifyOtp(request, env) {
 
   await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
   const role = roleForEmail(email, env);
+  const isOwner = parseEmailList(env.OWNER_EMAILS || env.ADMIN_EMAILS).includes(email);
   const userId = crypto.randomUUID();
   await db.prepare(
-    `INSERT INTO users (id, email, role, display_name, access_role, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at`,
-  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
+    `INSERT INTO users (id, email, role, display_name, access_role, is_owner, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at, is_owner = excluded.is_owner`,
+  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", isOwner ? 1 : 0, now, now).run();
 
-  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active FROM users WHERE email = ?").bind(email).first();
+  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active, is_owner, assigned_team FROM users WHERE email = ?").bind(email).first();
   const token = randomToken();
   const tokenHash = await sha256(token);
   await db.prepare(
@@ -258,7 +260,7 @@ async function verifyOtp(request, env) {
   ).bind(tokenHash, user.id, now + SESSION_SECONDS, now, now).run();
 
   return withCookie(
-    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
+    json({ user: { id: user.id, email: user.email, role: user.role, isOwner: Boolean(user.is_owner), displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
     sessionCookie(token),
   );
 }
@@ -270,7 +272,7 @@ async function getSessionUser(request, env) {
   const now = Math.floor(Date.now() / 1000);
   const db = requireDatabase(env);
   const row = await db.prepare(
-    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.assigned_team, s.expires_at
+    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.is_owner, u.assigned_team, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ?`,
   ).bind(tokenHash).first();
@@ -280,7 +282,7 @@ async function getSessionUser(request, env) {
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
   if (row.is_active === 0) return null;
-  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
+  return { id: row.id, email: row.email, role: row.role, isOwner: Boolean(row.is_owner), is_owner: row.is_owner, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -468,7 +470,7 @@ async function createStaff(request,user,env) {
   if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
   const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
   const email=normalizeEmail(parsed.body.email),name=String(parsed.body.displayName||"").trim(),role=String(parsed.body.accessRole||"agent");
-  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!["agent","supervisor","developer"].includes(role))return json({error:"Enter a valid email, name and non-owner staff role."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
   const team=String(parsed.body.assignedTeam||"").trim();
   if(team.length>100)return json({error:"Team name is too long."},400);
@@ -507,7 +509,7 @@ async function managerDashboard(user,env) {
 
 
 async function updateOwnProfile(request,user,env) {
-  if(user.role!=="admin") return json({error:"Only the administrator may edit this profile directly."},403);
+  if(!user.isOwner) return json({error:"Only the system owner may edit this profile directly."},403);
   const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
   const name=String(parsed.body.displayName||"").trim();
   if(name.length<2||name.length>80)return json({error:"Display name must be between 2 and 80 characters."},400);
@@ -520,7 +522,7 @@ async function managerUpdateStaff(request,user,env,targetId) {
   if(user.role!=="admin")return json({error:"Administrator access required."},403);
   const parsed=await readJson(request,5000);if(!parsed.ok)return parsed.response;
   const body=parsed.body,role=String(body.accessRole||"agent"),name=String(body.displayName||"").trim(),team=String(body.assignedTeam||"").trim();
-  if(!isSupportedAccessRole(role)||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team."},400);
+  if((!["agent","supervisor","developer"].includes(role)&&!(role==="admin"&&user.isOwner))||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team. Only the owner may appoint an administrator."},400);
   const custom=body.permissions;
   if(custom!==undefined && (!Array.isArray(custom)||custom.some(p=>!VALID_PERMISSIONS.includes(p))))return json({error:"One or more permissions are not supported."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
@@ -563,9 +565,7 @@ async function developerSettings(user,env,method,request) {
     const allowed=new Set(["allow_new_cases","default_case_team","case_export_enabled"]);
     if(!allowed.has(key)||value.length>100)return json({error:"Unsupported setting."},400);
     const now=Math.floor(Date.now()/1000);
-    await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();
-    await audit(db,user.id,"system.setting_updated",{key,value});
-    return json({ok:true});
+    if(user.isOwner){await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();await audit(db,user.id,"system.setting_updated",{key,value});return json({ok:true})}const approvalId=crypto.randomUUID();await db.prepare("INSERT INTO owner_approval_requests(id,requester_id,request_type,payload_json,reason,created_at) VALUES(?,?,?,?,?,?)").bind(approvalId,user.id,"sensitive_setting",JSON.stringify({key,value}),"Developer requested a protected system setting change.",now).run();await audit(db,user.id,"owner_approval.requested",{approvalId,key});return json({ok:true,pendingOwnerApproval:true,approvalId},202);
   }
   return json({error:"Method not allowed."},405);
 }
@@ -612,6 +612,8 @@ async function api(request, env) {
 
     const user = await getSessionUser(request, env);
     if (!user) return json({ error: "Sign in to access this workspace." }, 401);
+    const enterpriseResponse = await handleEnterpriseApi(request, user, env);
+    if (enterpriseResponse) return enterpriseResponse;
 
     if (path === "/api/profile" && method === "GET") return await profileMe(user,env);
     if (path === "/api/profile" && method === "PATCH") return await updateOwnProfile(request,user,env);
