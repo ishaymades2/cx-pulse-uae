@@ -2,6 +2,7 @@ name = "cx-pulse-uae2"
 main = "src/index.js"
 compatibility_date = "2026-11-21"
 workers_dev = true
+keep_vars = true
 
 [assets]
 directory = "./public"
@@ -19,4 +20,3 @@ APP_ENV = "production"
 ADMIN_EMAILS = "ishaymades@gmail.com"
 OWNER_EMAILS = "ishaymades@gmail.com"
 AGENT_EMAILS = "ishaymades2@gmail.com"
-FROM_EMAIL = "CX Pulse <onboarding@resend.dev>"

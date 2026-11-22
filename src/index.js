@@ -155,17 +155,15 @@ async function sendOtpEmail(env, email, code) {
     }),
   });
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    console.error("Email provider rejected OTP delivery:", response.status, detail.slice(0, 300));
-    throw new Error("OTP email delivery failed.");
+    console.error("Email provider rejected OTP submission:", response.status);
+    throw new Error("OTP email submission failed.");
   }
-  const result = await response.json().catch(() => ({}));
-  if (result.id) {
-    console.log("Resend accepted OTP email request:", result.id);
-  } else {
+  const result = await response.json().catch(() => null);
+  if (!result?.id) {
     console.error("Resend returned success without an email ID.");
+    throw new Error("OTP email submission could not be confirmed.");
   }
-  return result.id || null;
+  console.log("Resend accepted OTP email request:", result.id);
 }
 
 async function requestOtp(request, env) {
@@ -182,11 +180,11 @@ async function requestOtp(request, env) {
 
   const existingUser = await db.prepare("SELECT id, is_active FROM users WHERE email = ?").bind(email).first();
   const allowed = isAllowedEmail(email, env) || Boolean(existingUser?.is_active);
-  if (existingUser && !existingUser.is_active) return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
-  if (!allowed) {
-    // Do not disclose whether an email address is on the access list.
-    return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
-  }
+  const response = json({
+    message: "If this email is authorised, check your inbox and spam folder for a verification code.",
+  }, 202);
+  // Use the same response for inactive, unknown and authorised addresses.
+  if ((existingUser && !existingUser.is_active) || !allowed) return response;
 
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const ipKey = await sha256(`ip:${ip}`);
@@ -199,19 +197,20 @@ async function requestOtp(request, env) {
   const code = randomOtp();
   const codeHash = await sha256(`${email}:${code}:${env.OTP_PEPPER}`);
   const now = Math.floor(Date.now() / 1000);
-  await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
   await db.prepare(
-    "INSERT INTO otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)",
+    `INSERT INTO otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)
+     ON CONFLICT(email) DO UPDATE SET code_hash = excluded.code_hash,
+       expires_at = excluded.expires_at, attempts = 0, created_at = excluded.created_at`,
   ).bind(email, codeHash, now + OTP_SECONDS, now).run();
 
   try {
     await sendOtpEmail(env, email, code);
   } catch {
-    await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
-    return json({ error: "We could not submit the verification email. Check the Resend API response in Worker logs." }, 502);
+    await db.prepare("DELETE FROM otp_codes WHERE email = ? AND code_hash = ?").bind(email, codeHash).run();
+    return json({ error: "We could not submit the verification email. Please try again later." }, 502);
   }
 
-  return json({ message: "If this email is authorised, a verification code has been sent. Check your inbox and spam folder." }, 202);
+  return response;
 }
 
 async function verifyOtp(request, env) {
