@@ -242,16 +242,23 @@ async function verifyOtp(request, env) {
   }
 
   await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
+  return issueSession(db, env, email, now);
+}
+
+async function issueSession(db, env, email, now = Math.floor(Date.now() / 1000)) {
   const role = roleForEmail(email, env);
   const isOwner = parseEmailList(env.OWNER_EMAILS || env.ADMIN_EMAILS).includes(email);
   const userId = crypto.randomUUID();
   await db.prepare(
     `INSERT INTO users (id, email, role, display_name, access_role, is_owner, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at, is_owner = excluded.is_owner`,
+     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at, is_owner = excluded.is_owner,
+       role = CASE WHEN excluded.is_owner = 1 THEN 'admin' ELSE users.role END,
+       access_role = CASE WHEN excluded.is_owner = 1 THEN 'admin' ELSE users.access_role END`,
   ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", isOwner ? 1 : 0, now, now).run();
 
   const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active, is_owner, assigned_team FROM users WHERE email = ?").bind(email).first();
+  if (!user?.is_active) return json({ error: "Account unavailable." }, 403);
   const token = randomToken();
   const tokenHash = await sha256(token);
   await db.prepare(
@@ -262,6 +269,88 @@ async function verifyOtp(request, env) {
     json({ user: { id: user.id, email: user.email, role: user.role, isOwner: Boolean(user.is_owner), displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
     sessionCookie(token),
   );
+}
+
+const GOOGLE_COOKIE = "__Host-cxpulse_google";
+const GOOGLE_CALLBACK = "/api/auth/google/callback";
+
+function googleEnabled(env) {
+  return Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REDIRECT_URI);
+}
+
+function googleCookie(value, maxAge) {
+  return `${GOOGLE_COOKIE}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+}
+
+function redirect(location, cookie) {
+  const response = new Response(null, { status: 303, headers: { ...SECURITY_HEADERS, Location: location } });
+  return cookie ? withCookie(response, cookie) : response;
+}
+
+async function startGoogle(request, env) {
+  if (!googleEnabled(env)) return redirect("/?signin=unavailable");
+  const callback = new URL(env.GOOGLE_REDIRECT_URI);
+  if (callback.origin !== new URL(request.url).origin || callback.pathname !== GOOGLE_CALLBACK) {
+    return redirect("/?signin=unavailable");
+  }
+  const state = randomToken();
+  const verifier = randomToken();
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.search = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    redirect_uri: env.GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: "openid email",
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    prompt: "select_account",
+  }).toString();
+  return redirect(url.href, googleCookie(`${state}.${verifier}`, 600));
+}
+
+async function finishGoogle(request, env) {
+  const failure = () => redirect("/?signin=failed", googleCookie("", 0));
+  const url = new URL(request.url);
+  const [state, verifier] = getCookie(request, GOOGLE_COOKIE).split(".");
+  const code = url.searchParams.get("code");
+  if (!googleEnabled(env) || !state || !verifier || !code ||
+      !safeEqual(state, url.searchParams.get("state") || "")) return failure();
+
+  try {
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      body: new URLSearchParams({
+        client_id: env.GOOGLE_CLIENT_ID,
+        client_secret: env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: env.GOOGLE_REDIRECT_URI,
+        code,
+        code_verifier: verifier,
+        grant_type: "authorization_code",
+      }),
+    });
+    if (!tokenResponse.ok) return failure();
+    const { access_token: accessToken } = await tokenResponse.json();
+    if (!accessToken) return failure();
+    const identityResponse = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!identityResponse.ok) return failure();
+    const identity = await identityResponse.json();
+    const email = normalizeEmail(identity.email);
+    const owners = parseEmailList(env.OWNER_EMAILS || env.ADMIN_EMAILS);
+    if (identity.email_verified !== true || !email.endsWith("@gmail.com") || !owners.includes(email)) return failure();
+
+    const session = await issueSession(requireDatabase(env), env, email);
+    const cookie = session.headers.get("Set-Cookie");
+    return cookie ? withCookie(redirect("/", googleCookie("", 0)), cookie) : failure();
+  } catch {
+    console.error("Google sign-in could not be completed.");
+    return failure();
+  }
 }
 
 async function getSessionUser(request, env) {
@@ -601,6 +690,9 @@ async function api(request, env) {
   }
 
   try {
+    if (path === "/api/auth/google/status" && method === "GET") return json({ enabled: googleEnabled(env) });
+    if (path === "/api/auth/google" && method === "GET") return await startGoogle(request, env);
+    if (path === GOOGLE_CALLBACK && method === "GET") return await finishGoogle(request, env);
     if (path === "/api/auth/request-otp" && method === "POST") return await requestOtp(request, env);
     if (path === "/api/auth/verify-otp" && method === "POST") return await verifyOtp(request, env);
     if (path === "/api/auth/logout" && method === "POST") return await logout(request, env);
