@@ -509,7 +509,7 @@ async function managerDashboard(user,env) {
 
 
 async function updateOwnProfile(request,user,env) {
-  if(user.role!=="admin") return json({error:"Only the administrator may edit this profile directly."},403);
+  if(!user.isOwner) return json({error:"Only the system owner may edit this profile directly."},403);
   const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
   const name=String(parsed.body.displayName||"").trim();
   if(name.length<2||name.length>80)return json({error:"Display name must be between 2 and 80 characters."},400);
@@ -522,7 +522,7 @@ async function managerUpdateStaff(request,user,env,targetId) {
   if(user.role!=="admin")return json({error:"Administrator access required."},403);
   const parsed=await readJson(request,5000);if(!parsed.ok)return parsed.response;
   const body=parsed.body,role=String(body.accessRole||"agent"),name=String(body.displayName||"").trim(),team=String(body.assignedTeam||"").trim();
-  if(!isSupportedAccessRole(role)||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team."},400);
+  if((!["agent","supervisor","developer"].includes(role)&&!(role==="admin"&&user.isOwner))||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team. Only the owner may appoint an administrator."},400);
   const custom=body.permissions;
   if(custom!==undefined && (!Array.isArray(custom)||custom.some(p=>!VALID_PERMISSIONS.includes(p))))return json({error:"One or more permissions are not supported."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
