@@ -546,7 +546,7 @@ async function api(request, env) {
       if(!body.id)return json({error:"Approval ID required."},400);
       return await reviewApproval(request,user,env,String(body.id));
     }
-    const noteMatch=path.match(/^\\/api\\/manager\\/staff\\/([A-Za-z0-9-]+)\\/notes$/);
+    const noteMatch=path.match(/^\/api\/manager\/staff\/([A-Za-z0-9-]+)\/notes$/);
     if(noteMatch && method==="POST")return await addEmployeeNote(request,user,env,noteMatch[1]);
     if(noteMatch && method==="GET")return await listEmployeeNotes(user,env,noteMatch[1]);
     if (path === "/api/cases" && method === "GET") return await listCases(user, env);
