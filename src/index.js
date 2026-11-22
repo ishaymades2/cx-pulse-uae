@@ -1,3 +1,4 @@
+import { handleEnterpriseApi } from "./enterprise.js";
 import {
   isAllowedEmail,
   normalizeEmail,
@@ -243,14 +244,15 @@ async function verifyOtp(request, env) {
 
   await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
   const role = roleForEmail(email, env);
+  const isOwner = parseEmailList(env.OWNER_EMAILS || env.ADMIN_EMAILS).includes(email);
   const userId = crypto.randomUUID();
   await db.prepare(
-    `INSERT INTO users (id, email, role, display_name, access_role, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at`,
-  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
+    `INSERT INTO users (id, email, role, display_name, access_role, is_owner, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at, is_owner = excluded.is_owner`,
+  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", isOwner ? 1 : 0, now, now).run();
 
-  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active FROM users WHERE email = ?").bind(email).first();
+  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active, is_owner, assigned_team FROM users WHERE email = ?").bind(email).first();
   const token = randomToken();
   const tokenHash = await sha256(token);
   await db.prepare(
@@ -258,7 +260,7 @@ async function verifyOtp(request, env) {
   ).bind(tokenHash, user.id, now + SESSION_SECONDS, now, now).run();
 
   return withCookie(
-    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
+    json({ user: { id: user.id, email: user.email, role: user.role, isOwner: Boolean(user.is_owner), displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
     sessionCookie(token),
   );
 }
@@ -270,7 +272,7 @@ async function getSessionUser(request, env) {
   const now = Math.floor(Date.now() / 1000);
   const db = requireDatabase(env);
   const row = await db.prepare(
-    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.assigned_team, s.expires_at
+    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.is_owner, u.assigned_team, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ?`,
   ).bind(tokenHash).first();
@@ -280,7 +282,7 @@ async function getSessionUser(request, env) {
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
   if (row.is_active === 0) return null;
-  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
+  return { id: row.id, email: row.email, role: row.role, isOwner: Boolean(row.is_owner), is_owner: row.is_owner, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -612,6 +614,8 @@ async function api(request, env) {
 
     const user = await getSessionUser(request, env);
     if (!user) return json({ error: "Sign in to access this workspace." }, 401);
+    const enterpriseResponse = await handleEnterpriseApi(request, user, env);
+    if (enterpriseResponse) return enterpriseResponse;
 
     if (path === "/api/profile" && method === "GET") return await profileMe(user,env);
     if (path === "/api/profile" && method === "PATCH") return await updateOwnProfile(request,user,env);
