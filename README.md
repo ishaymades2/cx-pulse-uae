@@ -42,16 +42,16 @@ The production database `cx-pulse-uae-db` is already created, bound as `DB`, and
 
 ### 3. Configure email delivery and access
 
-For a first-person sign-in test, create the Resend account using the same address as the only administrator. Resend's shared testing sender `onboarding@resend.dev` can be used only for sending to the Resend account's own email address. For any additional staff recipients or production use, verify a domain you own and use a sender on that verified domain. Configure the following in Cloudflare Worker settings; do not commit secrets to GitHub:
+The administrator login and the Resend account owner are separate addresses in this setup. Keep the administrator address only in `ADMIN_EMAILS`. The Resend account owner's address may be placed temporarily in `AGENT_EMAILS` for a limited OTP delivery test. Resend's shared testing sender `onboarding@resend.dev` can send only to the Resend account owner's own email address; to deliver OTPs to the administrator or other staff, verify a domain you own in Resend and use a sender on that verified domain. Configure the following in Cloudflare Worker settings; do not commit secrets to GitHub:
 
 **Worker secrets**
 - `RESEND_API_KEY`: Resend API key.
 - `OTP_PEPPER`: long, random secret used to hash one-time codes.
 
 **Worker variables**
-- `FROM_EMAIL`: for the initial single-admin test, `CX Pulse <onboarding@resend.dev>`; for production, a sender on your verified domain.
-- `ADMIN_EMAILS`: comma-separated exact administrator email addresses (currently set this to the administrator's exact login email).
-- `AGENT_EMAILS`: comma-separated exact staff email addresses (leave unset until staff are approved).
+- `FROM_EMAIL`: `CX Pulse <onboarding@resend.dev>` only while testing delivery to the Resend account owner; for administrator/staff delivery, use a sender on your verified domain.
+- `ADMIN_EMAILS`: the exact administrator login email only.
+- `AGENT_EMAILS`: approved staff emails; the Resend account owner email may be included temporarily as an agent for the sandbox OTP test.
 
 Only allowlisted addresses can sign in. Admins can view all cases; agents can view cases they created or are assigned to. Keep the allowlists short and reviewed.
 

@@ -6,6 +6,7 @@ import {
   STATUSES,
   validateCasePayload,
 } from "./validation.js";
+import { hasPermission, permissionsForUser, isSupportedAccessRole, VALID_PERMISSIONS } from "./permissions.js";
 
 const SESSION_SECONDS = 60 * 60 * 24 * 7;
 const OTP_SECONDS = 10 * 60;
@@ -178,7 +179,9 @@ async function requestOtp(request, env) {
     return json({ error: "Enter a valid email address." }, 400);
   }
 
-  const allowed = isAllowedEmail(email, env);
+  const existingUser = await db.prepare("SELECT id, is_active FROM users WHERE email = ?").bind(email).first();
+  const allowed = isAllowedEmail(email, env) || Boolean(existingUser?.is_active);
+  if (existingUser && !existingUser.is_active) return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
   if (!allowed) {
     // Do not disclose whether an email address is on the access list.
     return json({ message: "If this email is authorised, a verification code will be sent." }, 202);
@@ -217,7 +220,8 @@ async function verifyOtp(request, env) {
   if (!parsed.ok) return parsed.response;
   const email = normalizeEmail(parsed.body.email);
   const code = String(parsed.body.code || "").trim();
-  if (!isAllowedEmail(email, env) || !/^\d{6}$/.test(code)) {
+  const eligible = isAllowedEmail(email, env) || Boolean(await db.prepare("SELECT id FROM users WHERE email = ? AND is_active = 1").bind(email).first());
+  if (!eligible || !/^\d{6}$/.test(code)) {
     return json({ error: "The code is invalid or has expired." }, 400);
   }
 
@@ -241,12 +245,12 @@ async function verifyOtp(request, env) {
   const role = roleForEmail(email, env);
   const userId = crypto.randomUUID();
   await db.prepare(
-    `INSERT INTO users (id, email, role, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(email) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
-  ).bind(userId, email, role, now, now).run();
+    `INSERT INTO users (id, email, role, display_name, access_role, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at`,
+  ).bind(userId, email, role, role === "admin" ? "Shaima" : email.split("@")[0], role === "admin" ? "admin" : "agent", now, now).run();
 
-  const user = await db.prepare("SELECT id, email, role FROM users WHERE email = ?").bind(email).first();
+  const user = await db.prepare("SELECT id, email, role, display_name, job_title, department, access_role, permissions_json, is_active FROM users WHERE email = ?").bind(email).first();
   const token = randomToken();
   const tokenHash = await sha256(token);
   await db.prepare(
@@ -254,7 +258,7 @@ async function verifyOtp(request, env) {
   ).bind(tokenHash, user.id, now + SESSION_SECONDS, now, now).run();
 
   return withCookie(
-    json({ user: { id: user.id, email: user.email, role: user.role } }),
+    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
     sessionCookie(token),
   );
 }
@@ -266,7 +270,7 @@ async function getSessionUser(request, env) {
   const now = Math.floor(Date.now() / 1000);
   const db = requireDatabase(env);
   const row = await db.prepare(
-    `SELECT u.id, u.email, u.role, s.expires_at
+    `SELECT u.id, u.email, u.role, u.display_name, u.job_title, u.department, u.access_role, u.permissions_json, u.is_active, u.assigned_team, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ?`,
   ).bind(tokenHash).first();
@@ -275,7 +279,8 @@ async function getSessionUser(request, env) {
     return null;
   }
   await db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").bind(now, tokenHash).run();
-  return { id: row.id, email: row.email, role: row.role };
+  if (row.is_active === 0) return null;
+  return { id: row.id, email: row.email, role: row.role, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team, permissions: permissionsForUser(row) };
 }
 
 async function logout(request, env) {
@@ -304,18 +309,22 @@ function caseDto(row) {
 }
 
 async function listCases(user, env) {
+  if(user.role!=="admin" && !hasPermission(user,"cases.view_own") && !hasPermission(user,"cases.view_team"))return json({error:"You do not have permission to view cases."},403);
   const db = requireDatabase(env);
   const query = user.role === "admin"
     ? await db.prepare(
         "SELECT * FROM cases ORDER BY updated_at DESC LIMIT 200",
       ).all()
-    : await db.prepare(
-        "SELECT * FROM cases WHERE created_by = ? OR assigned_to = ? ORDER BY updated_at DESC LIMIT 200",
-      ).bind(user.id, user.id).all();
+    : user.accessRole === "supervisor"
+      ? await db.prepare("SELECT * FROM cases WHERE team = ? ORDER BY updated_at DESC LIMIT 200").bind(user.assignedTeam || "").all()
+      : await db.prepare("SELECT * FROM cases WHERE created_by = ? OR assigned_to = ? ORDER BY updated_at DESC LIMIT 200").bind(user.id, user.id).all();
   return json({ cases: (query.results || []).map(caseDto) });
 }
 
 async function createCase(request, user, env) {
+  if(!hasPermission(user,"cases.create"))return json({error:"You do not have permission to create cases."},403);
+  const settings = await requireDatabase(env).prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_new_cases'").first();
+  if (settings && settings.setting_value === "false") return json({ error: "New case creation is temporarily disabled by the system administrator." }, 423);
   const parsed = await readJson(request);
   if (!parsed.ok) return parsed.response;
   const validated = validateCasePayload(parsed.body);
@@ -325,6 +334,7 @@ async function createCase(request, user, env) {
   const now = Math.floor(Date.now() / 1000);
   const id = `CX-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
   const value = validated.value;
+  if(user.accessRole==="supervisor") value.team=user.assignedTeam || "";
   await db.prepare(
     `INSERT INTO cases
      (id, customer_name, category, priority, status, team, summary, assigned_to, created_by, created_at, updated_at)
@@ -340,6 +350,7 @@ async function createCase(request, user, env) {
 }
 
 async function updateCase(request, user, env, caseId) {
+  if(user.role!=="admin" && !hasPermission(user,"cases.update_own") && !hasPermission(user,"cases.update_team"))return json({error:"You do not have permission to update cases."},403);
   const parsed = await readJson(request, 4_000);
   if (!parsed.ok) return parsed.response;
   const status = String(parsed.body.status || "");
@@ -348,9 +359,10 @@ async function updateCase(request, user, env, caseId) {
   const db = requireDatabase(env);
   const row = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(caseId).first();
   if (!row) return json({ error: "Case not found." }, 404);
-  if (user.role !== "admin" && row.created_by !== user.id && row.assigned_to !== user.id) {
-    return json({ error: "You do not have permission to update this case." }, 403);
-  }
+  const canUpdate = user.role === "admin"
+    || (user.accessRole === "supervisor" && row.team === user.assignedTeam && hasPermission(user,"cases.update_team"))
+    || (user.accessRole !== "supervisor" && (row.created_by === user.id || row.assigned_to === user.id) && hasPermission(user,"cases.update_own"));
+  if (!canUpdate) return json({ error: "You do not have permission to update this case." }, 403);
 
   const now = Math.floor(Date.now() / 1000);
   await db.prepare("UPDATE cases SET status = ?, updated_at = ? WHERE id = ?")
@@ -364,12 +376,15 @@ async function updateCase(request, user, env, caseId) {
 }
 
 async function reportSummary(user, env) {
+  if(user.role!=="admin" && !hasPermission(user,"reports.view_own") && !hasPermission(user,"reports.view_team"))return json({error:"You do not have permission to view reports."},403);
   const db = requireDatabase(env);
   const baseSql = user.role === "admin"
     ? "SELECT status, category, created_at FROM cases"
-    : "SELECT status, category, created_at FROM cases WHERE created_by = ? OR assigned_to = ?";
+    : user.accessRole === "supervisor"
+      ? "SELECT status, category, created_at FROM cases WHERE team = ?"
+      : "SELECT status, category, created_at FROM cases WHERE created_by = ? OR assigned_to = ?";
   const stmt = db.prepare(baseSql);
-  const result = user.role === "admin" ? await stmt.all() : await stmt.bind(user.id, user.id).all();
+  const result = user.role === "admin" ? await stmt.all() : user.accessRole === "supervisor" ? await stmt.bind(user.assignedTeam || "").all() : await stmt.bind(user.id, user.id).all();
   const rows = result.results || [];
   const total = rows.length;
   const resolved = rows.filter((row) => row.status === "Resolved").length;
@@ -389,6 +404,170 @@ async function reportSummary(user, env) {
     byCategory,
     source: "database",
   });
+}
+
+
+function audit(db, actorId, action, details = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  return db.prepare("INSERT INTO audit_log (id, actor_id, action, case_id, details_json, created_at) VALUES (?, ?, ?, NULL, ?, ?)")
+    .bind(crypto.randomUUID(), actorId, action, JSON.stringify(details), now).run();
+}
+function profileDto(row) {
+  return { id: row.id, email: row.email, displayName: row.display_name, jobTitle: row.job_title, department: row.department, accessRole: row.access_role, assignedTeam: row.assigned_team || "", permissions: permissionsForUser(row), isActive: Boolean(row.is_active), createdAt: row.created_at };
+}
+async function profileMe(user, env) {
+  const row = await requireDatabase(env).prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first();
+  return json({ profile: profileDto(row) });
+}
+async function createApproval(request, user, env) {
+  const parsed = await readJson(request, 3000); if (!parsed.ok) return parsed.response;
+  const type = String(parsed.body.type || "");
+  const reason = String(parsed.body.reason || "").trim();
+  if (!["name_change"].includes(type) || reason.length < 5 || reason.length > 500) return json({ error: "Provide a valid request and reason." }, 400);
+  const name = String(parsed.body.displayName || "").trim();
+  if (name.length < 2 || name.length > 80) return json({ error: "Name must be between 2 and 80 characters." }, 400);
+  const db = requireDatabase(env), now = Math.floor(Date.now()/1000), id = crypto.randomUUID();
+  await db.prepare("INSERT INTO approval_requests (id, requester_id, target_user_id, request_type, payload_json, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(id,user.id,user.id,type,JSON.stringify({displayName:name}),reason,now).run();
+  await audit(db,user.id,"approval.requested",{approvalId:id,type});
+  return json({ ok:true, requestId:id },201);
+}
+async function listApprovals(user, env) {
+  if (!hasPermission(user,"staff.view")) return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare(`SELECT a.*, u.email AS requester_email, u.display_name AS requester_name FROM approval_requests a JOIN users u ON u.id=a.requester_id ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 200`).all();
+  return json({requests:q.results||[]});
+}
+async function reviewApproval(request,user,env,id) {
+  if (user.role!=="admin") return json({error:"Only the administrator can approve requests."},403);
+  const parsed=await readJson(request,3000); if(!parsed.ok)return parsed.response;
+  const db=requireDatabase(env), row=await db.prepare("SELECT * FROM approval_requests WHERE id=?").bind(id).first();
+  if(!row)return json({error:"Request not found."},404);
+  if(row.status!=="pending")return json({error:"This request has already been reviewed."},409);
+  const decision=String(parsed.body.decision||""), note=String(parsed.body.note||"").trim();
+  if(!["approved","rejected"].includes(decision))return json({error:"Choose approve or reject."},400);
+  const now=Math.floor(Date.now()/1000);
+  if(decision==="approved" && row.request_type==="name_change"){
+    const payload=JSON.parse(row.payload_json||"{}");
+    await db.prepare("UPDATE users SET display_name=?, updated_at=? WHERE id=?").bind(payload.displayName,now,row.target_user_id).run();
+  }
+  if(decision==="approved" && row.request_type==="role_change"){
+    const payload=JSON.parse(row.payload_json||"{}");
+    if(!isSupportedAccessRole(payload.accessRole))return json({error:"Invalid role."},400);
+    await db.prepare("UPDATE users SET access_role=?, role='agent', permissions_json=?, updated_at=? WHERE id=?").bind(payload.accessRole,JSON.stringify(payload.permissions||[]),now,row.target_user_id).run();
+  }
+  await db.prepare("UPDATE approval_requests SET status=?, reviewed_by=?, review_note=?, reviewed_at=? WHERE id=?").bind(decision,user.id,note,now,id).run();
+  await audit(db,user.id,"approval."+decision,{approvalId:id,type:row.request_type,targetUserId:row.target_user_id});
+  return json({ok:true,status:decision});
+}
+async function listStaff(user,env) {
+  if(user.role!=="admin")return json({error:"Only the administrator can view the staff directory."},403);
+  const q=await requireDatabase(env).prepare("SELECT * FROM users ORDER BY created_at ASC").all();
+  return json({staff:(q.results||[]).map(profileDto)});
+}
+async function createStaff(request,user,env) {
+  if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const email=normalizeEmail(parsed.body.email),name=String(parsed.body.displayName||"").trim(),role=String(parsed.body.accessRole||"agent");
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
+  const team=String(parsed.body.assignedTeam||"").trim();
+  if(team.length>100)return json({error:"Team name is too long."},400);
+  await db.prepare("INSERT INTO users (id,email,role,display_name,job_title,department,access_role,permissions_json,is_active,assigned_team,created_at,updated_at) VALUES (?,?,'agent',?,'','',?,'{}',1,?,?,?) ON CONFLICT(email) DO NOTHING").bind(id,email,name,role,team,now,now).run();
+  const row=await db.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
+  if(row.id!==id)return json({error:"This email is already registered."},409);
+  await audit(db,user.id,"staff.created",{staffId:id,email,accessRole:role});
+  return json({staff:profileDto(row)},201);
+}
+async function addEmployeeNote(request,user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Only the administrator can add employee notes."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const note=String(parsed.body.note||"").trim(),visibility=parsed.body.visibility==="employee_visible"?"employee_visible":"manager_only";
+  if(note.length<2||note.length>2000)return json({error:"Note must be between 2 and 2,000 characters."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
+  await db.prepare("INSERT INTO employee_notes (id,employee_id,author_id,note_text,visibility,created_at) VALUES (?,?,?,?,?,?)").bind(id,targetId,user.id,note,visibility,now).run();
+  await audit(db,user.id,"employee.note_added",{employeeId:targetId,visibility});
+  return json({ok:true,id},201);
+}
+async function listEmployeeNotes(user,env,targetId) {
+  if(user.role!=="admin"&&user.id!==targetId)return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare("SELECT n.*,u.display_name AS author_name FROM employee_notes n JOIN users u ON u.id=n.author_id WHERE n.employee_id=? AND (n.visibility='employee_visible' OR ?='admin') ORDER BY n.created_at DESC").bind(targetId,user.role).all();
+  return json({notes:q.results||[]});
+}
+async function managerDashboard(user,env) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  const db=requireDatabase(env);
+  const [staff,approvals,notes,auditRows]=await Promise.all([
+    db.prepare("SELECT COUNT(*) AS total, SUM(is_active) AS active FROM users").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM approval_requests WHERE status='pending'").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM employee_notes").first(),
+    db.prepare("SELECT COUNT(*) AS total FROM audit_log").first()
+  ]);
+  return json({staff:staff?.total||0,activeStaff:staff?.active||0,pendingApprovals:approvals?.total||0,notes:notes?.total||0,auditEvents:auditRows?.total||0});
+}
+
+
+async function updateOwnProfile(request,user,env) {
+  if(user.role!=="admin") return json({error:"Only the administrator may edit this profile directly."},403);
+  const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+  const name=String(parsed.body.displayName||"").trim();
+  if(name.length<2||name.length>80)return json({error:"Display name must be between 2 and 80 characters."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  await db.prepare("UPDATE users SET display_name=?,updated_at=? WHERE id=?").bind(name,now,user.id).run();
+  await audit(db,user.id,"profile.admin_name_updated",{displayName:name});
+  return json({ok:true,displayName:name});
+}
+async function managerUpdateStaff(request,user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  const parsed=await readJson(request,5000);if(!parsed.ok)return parsed.response;
+  const body=parsed.body,role=String(body.accessRole||"agent"),name=String(body.displayName||"").trim(),team=String(body.assignedTeam||"").trim();
+  if(!isSupportedAccessRole(role)||name.length<2||name.length>80||team.length>100)return json({error:"Enter a valid name, role and team."},400);
+  const custom=body.permissions;
+  if(custom!==undefined && (!Array.isArray(custom)||custom.some(p=>!VALID_PERMISSIONS.includes(p))))return json({error:"One or more permissions are not supported."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  const current=await db.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  if(!current)return json({error:"Employee not found."},404);
+  const perms=custom===undefined?current.permissions_json:JSON.stringify([...new Set(custom)]);
+  await db.prepare("UPDATE users SET display_name=?,access_role=?,permissions_json=?,assigned_team=?,updated_at=? WHERE id=?").bind(name,role,perms,team,now,targetId).run();
+  await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
+  await audit(db,user.id,"staff.updated",{targetUserId:targetId,accessRole:role,assignedTeam:team});
+  const updated=await db.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  return json({staff:profileDto(updated)});
+}
+async function managerDeactivateStaff(user,env,targetId) {
+  if(user.role!=="admin")return json({error:"Administrator access required."},403);
+  if(user.id===targetId)return json({error:"You cannot disable your own administrator account."},400);
+  const db=requireDatabase(env),now=Math.floor(Date.now()/1000);
+  const row=await db.prepare("SELECT id,email FROM users WHERE id=?").bind(targetId).first();
+  if(!row)return json({error:"Employee not found."},404);
+  await db.prepare("UPDATE users SET is_active=0,updated_at=? WHERE id=?").bind(now,targetId).run();
+  await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(targetId).run();
+  await audit(db,user.id,"staff.disabled",{targetUserId:targetId,email:row.email});
+  return json({ok:true});
+}
+async function managerAudit(user,env) {
+  if(user.role!=="admin" && !hasPermission(user,"system.view_audit"))return json({error:"Permission denied."},403);
+  const q=await requireDatabase(env).prepare("SELECT a.*,u.email,u.display_name FROM audit_log a JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT 200").all();
+  return json({events:q.results||[]});
+}
+async function developerSettings(user,env,method,request) {
+  if(!hasPermission(user,"system.view_integrations"))return json({error:"Permission denied."},403);
+  const db=requireDatabase(env);
+  if(method==="GET"){
+    const q=await db.prepare("SELECT setting_key,setting_value,updated_at FROM system_settings ORDER BY setting_key").all();
+    return json({settings:q.results||[]});
+  }
+  if(method==="PUT"){
+    if(!hasPermission(user,"system.manage_settings"))return json({error:"Permission denied."},403);
+    const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
+    const key=String(parsed.body.key||""),value=String(parsed.body.value||"");
+    const allowed=new Set(["allow_new_cases","default_case_team","case_export_enabled"]);
+    if(!allowed.has(key)||value.length>100)return json({error:"Unsupported setting."},400);
+    const now=Math.floor(Date.now()/1000);
+    await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();
+    await audit(db,user.id,"system.setting_updated",{key,value});
+    return json({ok:true});
+  }
+  return json({error:"Method not allowed."},405);
 }
 
 async function api(request, env) {
@@ -426,13 +605,34 @@ async function api(request, env) {
     if (path === "/api/auth/request-otp" && method === "POST") return await requestOtp(request, env);
     if (path === "/api/auth/verify-otp" && method === "POST") return await verifyOtp(request, env);
     if (path === "/api/auth/logout" && method === "POST") return await logout(request, env);
+    if (path === "/api/auth/me" && method === "GET") {
+      const me = await getSessionUser(request, env);
+      return me ? json({user:me}) : json({user:null},401);
+    }
 
     const user = await getSessionUser(request, env);
-    if (path === "/api/auth/me" && method === "GET") {
-      return user ? json({ user }) : json({ user: null }, 401);
-    }
     if (!user) return json({ error: "Sign in to access this workspace." }, 401);
 
+    if (path === "/api/profile" && method === "GET") return await profileMe(user,env);
+    if (path === "/api/profile" && method === "PATCH") return await updateOwnProfile(request,user,env);
+    if (path === "/api/manager/audit" && method === "GET") return await managerAudit(user,env);
+    if (path === "/api/developer/settings" && (method === "GET" || method === "PUT")) return await developerSettings(user,env,method,request);
+    const staffMatch=path.match(/^\/api\/manager\/staff\/([A-Za-z0-9-]+)$/);
+    if(staffMatch && method==="PATCH")return await managerUpdateStaff(request,user,env,staffMatch[1]);
+    if(staffMatch && method==="DELETE")return await managerDeactivateStaff(user,env,staffMatch[1]);
+    if (path === "/api/profile/name-request" && method === "POST") return await createApproval(request,user,env);
+    if (path === "/api/manager/summary" && method === "GET") return await managerDashboard(user,env);
+    if (path === "/api/manager/staff" && method === "GET") return await listStaff(user,env);
+    if (path === "/api/manager/staff" && method === "POST") return await createStaff(request,user,env);
+    if (path === "/api/manager/approvals" && method === "GET") return await listApprovals(user,env);
+    if (path === "/api/manager/approvals" && method === "POST") {
+      const body=await request.clone().json().catch(()=>({}));
+      if(!body.id)return json({error:"Approval ID required."},400);
+      return await reviewApproval(request,user,env,String(body.id));
+    }
+    const noteMatch=path.match(/^\/api\/manager\/staff\/([A-Za-z0-9-]+)\/notes$/);
+    if(noteMatch && method==="POST")return await addEmployeeNote(request,user,env,noteMatch[1]);
+    if(noteMatch && method==="GET")return await listEmployeeNotes(user,env,noteMatch[1]);
     if (path === "/api/cases" && method === "GET") return await listCases(user, env);
     if (path === "/api/cases" && method === "POST") return await createCase(request, user, env);
     if (path === "/api/reports/summary" && method === "GET") return await reportSummary(user, env);
