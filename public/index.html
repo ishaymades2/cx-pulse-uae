@@ -71,7 +71,7 @@ $("#today").textContent=new Intl.DateTimeFormat("en-AE",{weekday:"long",day:"num
 </script><style>
 .demo-notice{display:flex;gap:10px;align-items:flex-start;margin:0 0 22px;padding:13px 16px;border:1px solid #e5d5b5;border-radius:12px;background:#fffaf0;color:#6d5425;font-size:12px}.demo-notice strong{white-space:nowrap;letter-spacing:.08em;font-size:10px}.demo-notice[hidden]{display:none}.authbar{display:flex;gap:8px;align-items:center}.authbtn{border:1px solid #dce2e8;background:white;border-radius:9px;padding:8px 12px;color:#14263d;font-weight:650}.authpanel{display:none;position:fixed;inset:0;background:#14263d99;z-index:20;place-items:center;padding:16px}.authpanel.show{display:grid}.authbox{width:min(430px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 25px 80px #0003}.authbox h2{margin:0 0 7px}.authbox p{color:#718096;font-size:13px}.authbox input{width:100%;border:1px solid #e6e9ee;border-radius:9px;padding:12px;margin:7px 0 12px}.authmsg{font-size:12px;min-height:20px;color:#b94b4b}.caseaction{border:1px solid #dce2e8;border-radius:7px;padding:5px 8px;background:#fff;font-size:11px}.liveflag{font-size:10px;color:#27745e;font-weight:700}.authuser{font-size:11px;color:#718096}
 </style>
-<div class="authpanel" id="authPanel"><div class="authbox"><div class="eyebrow">SECURE WORKSPACE</div><h2>CX Pulse UAE</h2><p>Sign in with an authorised work email. A six-digit code will be sent to your inbox.</p><form id="otpRequest"><label>Email address</label><input type="email" id="authEmail" autocomplete="email" required placeholder="name@company.com"><button class="primary" type="submit">Send verification code</button></form><form id="otpVerify" style="display:none"><label>Six-digit verification code</label><input id="authCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" placeholder="000000"><button class="primary" type="submit">Verify and sign in</button><button class="ghost" id="otpBack" type="button">Change email or request a new code</button></form><div class="authmsg" id="authMsg" role="status"></div><button class="ghost" id="authClose" type="button">Close</button></div></div>
+<div class="authpanel" id="authPanel"><div class="authbox"><div class="eyebrow">SECURE WORKSPACE</div><h2>CX Pulse UAE</h2><p>Sign in with an authorised work email. A six-digit code will be sent to your inbox.</p><p id="googleSignIn" hidden><a class="primary" href="/api/auth/google" data-en="Sign in with Google" data-ar="الدخول عبر Google">Sign in with Google</a></p><form id="otpRequest"><label>Email address</label><input type="email" id="authEmail" autocomplete="email" required placeholder="name@company.com"><button class="primary" type="submit">Send verification code</button></form><form id="otpVerify" style="display:none"><label>Six-digit verification code</label><input id="authCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" placeholder="000000"><button class="primary" type="submit">Verify and sign in</button><button class="ghost" id="otpBack" type="button">Change email or request a new code</button></form><div class="authmsg" id="authMsg" role="status"></div><button class="ghost" id="authClose" type="button">Close</button></div></div>
 <script>
 (()=>{
 const $=s=>document.querySelector(s);
@@ -138,6 +138,17 @@ document.addEventListener("click",async e=>{const edit=e.target.closest("[data-e
 document.addEventListener("click",async e=>{const r=e.target.closest("[data-review]");if(r){try{await api("/api/manager/approvals",{method:"POST",body:JSON.stringify({id:r.dataset.review,decision:r.dataset.decision,note:prompt("Review note (optional):")||""})});await loadManager()}catch(x){alert(x.message)}}const n=e.target.closest("[data-note]");if(n){const note=prompt("Manager-only note:");if(note)try{await api("/api/manager/staff/"+n.dataset.note+"/notes",{method:"POST",body:JSON.stringify({note,visibility:"manager_only"})});alert("Note saved.")}catch(x){alert(x.message)}}});
 document.addEventListener("click",e=>{if(e.target.closest("#profileAvatar"))goto("profile")});
 authButton();
+api("/api/auth/google/status").then(({enabled})=>{
+  $("#googleSignIn").hidden=!enabled;
+}).catch(()=>{});
+const signInResult=new URLSearchParams(location.search).get("signin");
+if(signInResult==="failed"||signInResult==="unavailable"){
+  $("#authOpen").click();
+  message(lang==="ar"
+    ?"تعذّر تسجيل الدخول عبر Google. اختاري حساب مالك معتمد وحاولي مرة ثانية."
+    :"Google sign-in could not be completed. Choose an approved owner account and try again.");
+  history.replaceState(null,"",location.pathname);
+}
 api("/api/auth/me").then(x=>x.user&&signedIn(x.user)).catch(()=>{});
 })();
 </script></body></html>
