@@ -258,7 +258,7 @@ async function verifyOtp(request, env) {
   ).bind(tokenHash, user.id, now + SESSION_SECONDS, now, now).run();
 
   return withCookie(
-    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role } }),
+    json({ user: { id: user.id, email: user.email, role: user.role, displayName: user.display_name, accessRole: user.access_role, assignedTeam: user.assigned_team || "" } }),
     sessionCookie(token),
   );
 }
@@ -309,6 +309,7 @@ function caseDto(row) {
 }
 
 async function listCases(user, env) {
+  if(user.role!=="admin" && !hasPermission(user,"cases.view_own") && !hasPermission(user,"cases.view_team"))return json({error:"You do not have permission to view cases."},403);
   const db = requireDatabase(env);
   const query = user.role === "admin"
     ? await db.prepare(
@@ -321,6 +322,7 @@ async function listCases(user, env) {
 }
 
 async function createCase(request, user, env) {
+  if(!hasPermission(user,"cases.create"))return json({error:"You do not have permission to create cases."},403);
   const settings = await requireDatabase(env).prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_new_cases'").first();
   if (settings && settings.setting_value === "false") return json({ error: "New case creation is temporarily disabled by the system administrator." }, 423);
   const parsed = await readJson(request);
@@ -332,6 +334,7 @@ async function createCase(request, user, env) {
   const now = Math.floor(Date.now() / 1000);
   const id = `CX-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
   const value = validated.value;
+  if(user.accessRole==="supervisor") value.team=user.assignedTeam || "";
   await db.prepare(
     `INSERT INTO cases
      (id, customer_name, category, priority, status, team, summary, assigned_to, created_by, created_at, updated_at)
@@ -347,6 +350,7 @@ async function createCase(request, user, env) {
 }
 
 async function updateCase(request, user, env, caseId) {
+  if(user.role!=="admin" && !hasPermission(user,"cases.update_own") && !hasPermission(user,"cases.update_team"))return json({error:"You do not have permission to update cases."},403);
   const parsed = await readJson(request, 4_000);
   if (!parsed.ok) return parsed.response;
   const status = String(parsed.body.status || "");
@@ -371,6 +375,7 @@ async function updateCase(request, user, env, caseId) {
 }
 
 async function reportSummary(user, env) {
+  if(user.role!=="admin" && !hasPermission(user,"reports.view_own") && !hasPermission(user,"reports.view_team"))return json({error:"You do not have permission to view reports."},403);
   const db = requireDatabase(env);
   const baseSql = user.role === "admin"
     ? "SELECT status, category, created_at FROM cases"
