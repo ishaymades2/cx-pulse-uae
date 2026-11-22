@@ -359,9 +359,10 @@ async function updateCase(request, user, env, caseId) {
   const db = requireDatabase(env);
   const row = await db.prepare("SELECT * FROM cases WHERE id = ?").bind(caseId).first();
   if (!row) return json({ error: "Case not found." }, 404);
-  if (user.role !== "admin" && !(user.accessRole === "supervisor" && row.team === user.assignedTeam) && row.created_by !== user.id && row.assigned_to !== user.id) {
-    return json({ error: "You do not have permission to update this case." }, 403);
-  }
+  const canUpdate = user.role === "admin"
+    || (user.accessRole === "supervisor" && row.team === user.assignedTeam && hasPermission(user,"cases.update_team"))
+    || (user.accessRole !== "supervisor" && (row.created_by === user.id || row.assigned_to === user.id) && hasPermission(user,"cases.update_own"));
+  if (!canUpdate) return json({ error: "You do not have permission to update this case." }, 403);
 
   const now = Math.floor(Date.now() / 1000);
   await db.prepare("UPDATE cases SET status = ?, updated_at = ? WHERE id = ?")
