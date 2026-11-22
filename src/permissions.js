@@ -20,8 +20,10 @@ export const ROLE_PERMISSIONS = {
     "system.view_health","system.view_audit","system.view_integrations",
     "system.manage_settings","system.manage_feature_flags","system.manage_deployments",
     "system.manage_backups","system.view_data","system.manage_data",
-    "cases.view_all","customers.view","tasks.view_all","teams.view",
-    "reports.view_all","notifications.view","knowledge.view","feedback.view",
+    "cases.view_all","cases.create","cases.update_all","cases.assign",
+    "customers.view","customers.manage","tasks.view_all","tasks.manage",
+    "teams.view","teams.manage","reports.view_all","notifications.view",
+    "knowledge.view","knowledge.manage","feedback.view","feedback.manage",
     "profile.view","profile.request_name_change"
   ],
   agent: [
