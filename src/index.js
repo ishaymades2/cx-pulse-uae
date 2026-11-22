@@ -470,7 +470,7 @@ async function createStaff(request,user,env) {
   if(user.role!=="admin")return json({error:"Only the administrator can add staff."},403);
   const parsed=await readJson(request,3000);if(!parsed.ok)return parsed.response;
   const email=normalizeEmail(parsed.body.email),name=String(parsed.body.displayName||"").trim(),role=String(parsed.body.accessRole||"agent");
-  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!isSupportedAccessRole(role))return json({error:"Enter a valid email, name and staff role."},400);
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||name.length<2||name.length>80||!["agent","supervisor","developer"].includes(role))return json({error:"Enter a valid email, name and non-owner staff role."},400);
   const db=requireDatabase(env),now=Math.floor(Date.now()/1000),id=crypto.randomUUID();
   const team=String(parsed.body.assignedTeam||"").trim();
   if(team.length>100)return json({error:"Team name is too long."},400);
