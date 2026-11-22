@@ -49,6 +49,8 @@ The administrator login and the Resend account owner are separate addresses in t
 - `OTP_PEPPER`: long, random secret used to hash one-time codes.
 
 **Worker variables**
+
+Set `FROM_EMAIL` in the Worker dashboard before deploying. Wrangler preserves dashboard variables so subsequent code releases can retain the verified sender.
 - `FROM_EMAIL`: `CX Pulse <onboarding@resend.dev>` only while testing delivery to the Resend account owner; for administrator/staff delivery, use a sender on your verified domain.
 - `ADMIN_EMAILS`: the exact administrator login email only.
 - `AGENT_EMAILS`: approved staff emails; the Resend account owner email may be included temporarily as an agent for the sandbox OTP test.
