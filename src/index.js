@@ -321,6 +321,8 @@ async function listCases(user, env) {
 }
 
 async function createCase(request, user, env) {
+  const settings = await requireDatabase(env).prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_new_cases'").first();
+  if (settings && settings.setting_value === "false") return json({ error: "New case creation is temporarily disabled by the system administrator." }, 423);
   const parsed = await readJson(request);
   if (!parsed.ok) return parsed.response;
   const validated = validateCasePayload(parsed.body);
