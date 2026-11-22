@@ -157,6 +157,13 @@ async function sendOtpEmail(env, email, code) {
     console.error("Email provider rejected OTP delivery:", response.status, detail.slice(0, 300));
     throw new Error("OTP email delivery failed.");
   }
+  const result = await response.json().catch(() => ({}));
+  if (result.id) {
+    console.log("Resend accepted OTP email request:", result.id);
+  } else {
+    console.error("Resend returned success without an email ID.");
+  }
+  return result.id || null;
 }
 
 async function requestOtp(request, env) {
@@ -197,10 +204,10 @@ async function requestOtp(request, env) {
     await sendOtpEmail(env, email, code);
   } catch {
     await db.prepare("DELETE FROM otp_codes WHERE email = ?").bind(email).run();
-    return json({ error: "We could not send the verification email. Check the email provider configuration and try again." }, 502);
+    return json({ error: "We could not submit the verification email. Check the Resend API response in Worker logs." }, 502);
   }
 
-  return json({ message: "If this email is authorised, a verification code has been sent." }, 202);
+  return json({ message: "If this email is authorised, a verification code has been sent. Check your inbox and spam folder." }, 202);
 }
 
 async function verifyOtp(request, env) {
