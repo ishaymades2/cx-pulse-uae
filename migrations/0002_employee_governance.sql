@@ -12,15 +12,15 @@ ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1
 
 UPDATE users
 SET role = 'agent', access_role = 'agent', permissions_json = '{}'
-WHERE lower(email) <> 'ishaymades2@gmail.com' AND role = 'admin';
+WHERE lower(email) <> 'ishaymades@gmail.com' AND role = 'admin';
 
 UPDATE users
 SET role = 'admin', access_role = 'admin'
-WHERE lower(email) = 'ishaymades2@gmail.com';
+WHERE lower(email) = 'ishaymades@gmail.com';
 
 UPDATE users
 SET display_name = CASE
-  WHEN lower(email) = 'ishaymades2@gmail.com' THEN 'Shaima'
+  WHEN lower(email) = 'ishaymades@gmail.com' THEN 'Shaima'
   ELSE substr(email, 1, instr(email, '@') - 1)
 END
 WHERE display_name = '';
