@@ -565,9 +565,7 @@ async function developerSettings(user,env,method,request) {
     const allowed=new Set(["allow_new_cases","default_case_team","case_export_enabled"]);
     if(!allowed.has(key)||value.length>100)return json({error:"Unsupported setting."},400);
     const now=Math.floor(Date.now()/1000);
-    await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();
-    await audit(db,user.id,"system.setting_updated",{key,value});
-    return json({ok:true});
+    if(user.isOwner){await db.prepare("INSERT INTO system_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(key,value,user.id,now).run();await audit(db,user.id,"system.setting_updated",{key,value});return json({ok:true})}const approvalId=crypto.randomUUID();await db.prepare("INSERT INTO owner_approval_requests(id,requester_id,request_type,payload_json,reason,created_at) VALUES(?,?,?,?,?,?)").bind(approvalId,user.id,"sensitive_setting",JSON.stringify({key,value}),"Developer requested a protected system setting change.",now).run();await audit(db,user.id,"owner_approval.requested",{approvalId,key});return json({ok:true,pendingOwnerApproval:true,approvalId},202);
   }
   return json({error:"Method not allowed."},405);
 }
