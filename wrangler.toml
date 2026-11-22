@@ -16,3 +16,5 @@ migrations_dir = "migrations"
 
 [vars]
 APP_ENV = "production"
+ADMIN_EMAILS = "ishaymades@gmail.com"
+FROM_EMAIL = "CX Pulse <onboarding@resend.dev>"
